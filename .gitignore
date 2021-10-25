@@ -1,0 +1,16 @@
+*.pkl
+*.pt
+*.pyc
+*.save
+__pycache__
+*.tar
+.vc
+.gitattributes
+*.pth
+synthesizer/saved_models/*
+*.zip
+*.mp4
+*.wav
+*.npz
+*.ckpt*
+*.idea
