@@ -9,6 +9,8 @@ from utils.argutils import print_args
 import argparse
 from pathlib import Path
 import os
+import numpy as np
+import tensorflow as tf
 
 #Prepares the data.
 def prepare_run(args):
@@ -17,26 +19,43 @@ def prepare_run(args):
     log_dir = os.path.join(args.models_dir, "logs-{}".format(run_name))
     os.makedirs(log_dir, exist_ok=True)
 
+    # seed the randomizer
+    seed = 1234
+    np.random.seed(seed)
+    random.seed(seed)
+    tf.random.set_random_seed(seed)
+
     # all_images = get_image_list('test', args.data_root)
     # all_test_images = get_image_list('test', args.data_root)
 
-    all_speakers = [p.name for p in Path(args.data_root).glob('*') if p.is_dir()]
-    test_speakers = ['s27', 's34']  # hold out speakers (man, woman) for testing (~2000 examples)
-    training_speakers = list(set(all_speakers) - set(test_speakers))
-    print('Num Total Speakers:', len(all_speakers))
-    print('Num Training Speakers:', len(training_speakers))
+    """
+    GRID:
+    """
+    # all_speakers = [p.name for p in Path(args.data_root).glob('*') if p.is_dir()]
+    # test_speakers = ['s27', 's34']  # hold out speakers (man, woman) for testing (~2000 examples)
+    # training_speakers = list(set(all_speakers) - set(test_speakers))
+    # print('Num Total Speakers:', len(all_speakers))
+    # print('Num Training Speakers:', len(training_speakers))
+    #
+    # # grab phrases from users in training to hold out for testing
+    # all_training_phrases = list([p.name for p in Path(args.data_root).glob('*/*')
+    #                              if p.is_dir() and p.parts[-2] in training_speakers])
+    # print('Total Num Training Phrases:', len(all_training_phrases))
+    # random.seed(hparams.tacotron_data_random_state)
+    # random.shuffle(all_training_phrases)
+    # holdout_phrases = all_training_phrases[:100]  # 100 examples
+    # holdout_phrases = ['swag7p', 'bwiq7s', 'sgia2n', 'prwv4p', 'lrab2s', 'bbwq8s', 'bwwl4n', 'sria3a', 'pbal7a', 'lbii9s', 'swwn8s', 'srwn6a', 'sgif4n', 'sbat3s', 'sgbg8p', 'swbv4a', 'srwu3n', 'bbak5a', 'lbib6p', 'lgay8p', 'bgaz8n', 'bgam8n', 'swbr8n', 'lgwr4s', 'bwbs5p', 'brbr9n', 'lway3n', 'prbn5p', 'pbaf5s', 'lradzs', 'sbie2n', 'lgwq7p', 'sbbh5a', 'pwbh3p', 'brajzp', 'lwwf5p', 'bwbz5a', 'bwbg3n', 'lwbl3n', 'bgbn7p', 'pgio6s', 'bgaf4s', 'lbit9p', 'lgac2n', 'lrbp6s', 'brwl7a', 'sgab3s', 'lgwz1p', 'prbn2s', 'pgij8a', 'lwbq6p', 'swbczp', 'bbii5a', 'pwwv4a', 'lwax7s', 'prao9p', 'pbwc1n', 'sbas6s', 'sbim6a', 'swiz7a', 'sbaf2s', 'brir7a', 'lgidzp', 'lgbv9a', 'bwiz2n', 'pwwn8p', 'pbia5p', 'lbbh6a', 'lwav9s', 'swwu1s', 'srbu6s', 'sgag3n', 'bwie3s', 'sgbi5p', 'brix8a', 'pwan5a', 'pgbj5p', 'bbwk5n', 'pgbb9n', 'sgib9s', 'sban1p', 'pbis6p', 'lbim7s', 'lbbb3s', 'brwkzs', 'sriq4n', 'pgaq4p', 'sbiy6a', 'pgao9p', 'lwal2n', 'pbanzs', 'pbam7n', 'lrwfzs', 'lgbj5s', 'sbwb2s', 'lwwz7a', 'lrae2n', 'pwbp8p', 'sgwi8n', 'srbf9n']
+    # print('Holdout Phrases:', holdout_phrases)
+    #
+    # all_training_images = get_image_list_2(args.data_root, training_speakers, holdout_phrases)
+    # all_test_images = get_image_list_2(args.data_root, test_speakers)
 
-    # grab phrases from users in training to hold out for testing
-    all_training_phrases = list([p.name for p in Path(args.data_root).glob('*/*')
-                                 if p.is_dir() and p.parts[-2] in training_speakers])
-    print('Total Num Training Phrases:', len(all_training_phrases))
-    random.seed(hparams.tacotron_data_random_state)
-    random.shuffle(all_training_phrases)
-    holdout_phrases = all_training_phrases[:100]  # 100 examples
-    holdout_phrases = ['swag7p', 'bwiq7s', 'sgia2n', 'prwv4p', 'lrab2s', 'bbwq8s', 'bwwl4n', 'sria3a', 'pbal7a', 'lbii9s', 'swwn8s', 'srwn6a', 'sgif4n', 'sbat3s', 'sgbg8p', 'swbv4a', 'srwu3n', 'bbak5a', 'lbib6p', 'lgay8p', 'bgaz8n', 'bgam8n', 'swbr8n', 'lgwr4s', 'bwbs5p', 'brbr9n', 'lway3n', 'prbn5p', 'pbaf5s', 'lradzs', 'sbie2n', 'lgwq7p', 'sbbh5a', 'pwbh3p', 'brajzp', 'lwwf5p', 'bwbz5a', 'bwbg3n', 'lwbl3n', 'bgbn7p', 'pgio6s', 'bgaf4s', 'lbit9p', 'lgac2n', 'lrbp6s', 'brwl7a', 'sgab3s', 'lgwz1p', 'prbn2s', 'pgij8a', 'lwbq6p', 'swbczp', 'bbii5a', 'pwwv4a', 'lwax7s', 'prao9p', 'pbwc1n', 'sbas6s', 'sbim6a', 'swiz7a', 'sbaf2s', 'brir7a', 'lgidzp', 'lgbv9a', 'bwiz2n', 'pwwn8p', 'pbia5p', 'lbbh6a', 'lwav9s', 'swwu1s', 'srbu6s', 'sgag3n', 'bwie3s', 'sgbi5p', 'brix8a', 'pwan5a', 'pgbj5p', 'bbwk5n', 'pgbb9n', 'sgib9s', 'sban1p', 'pbis6p', 'lbim7s', 'lbbb3s', 'brwkzs', 'sriq4n', 'pgaq4p', 'sbiy6a', 'pgao9p', 'lwal2n', 'pbanzs', 'pbam7n', 'lrwfzs', 'lgbj5s', 'sbwb2s', 'lwwz7a', 'lrae2n', 'pwbp8p', 'sgwi8n', 'srbf9n']
-    print('Holdout Phrases:', holdout_phrases)
-
-    all_training_images = get_image_list_2(args.data_root, training_speakers, holdout_phrases)
+    """
+    SRAVI:
+    """
+    training_speakers = ['AP', 'DB', 'JMC', 'ML']
+    test_speakers = ['RMC', 'LMQ']
+    all_training_images = get_image_list_2(args.data_root, training_speakers)
     all_test_images = get_image_list_2(args.data_root, test_speakers)
 
     hparams.add_hparam('all_images', all_training_images)

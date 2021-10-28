@@ -22,6 +22,7 @@ from pathlib import Path
 # from lip_movement_encoder_utils import get_lip_movement_embedding, get_cfe_features
 
 import face_detection
+from video_inference import VIDEO_CONVERT_FPS_COMMAND
 
 # sys.path.append('/shared/Repos/video_harvesting/app/main/services/sync_net')
 # from main.utils.preprocessing import extract_audio, reset_scale_and_frame_rate, preprocess_video_and_audio
@@ -37,11 +38,12 @@ parser.add_argument("--split", help="* | train | val | test (* will preprocess a
 parser.add_argument('--extract_lip_movement_embeddings', action='store_true')
 parser.add_argument('--lrw_preprocessing', action='store_true')
 parser.add_argument('--copy_original_video', action='store_true')
+parser.add_argument('--fps', type=int)
 
 args = parser.parse_args()
 
-fa = [face_detection.FaceAlignment(face_detection.LandmarksType._2D, flip_input=False, 
-									device='cuda:{}'.format(id)) for id in range(args.ngpu)]
+fa = [face_detection.FaceAlignment(face_detection.LandmarksType._2D, flip_input=False,
+								   device='cuda:{}'.format(id)) for id in range(args.ngpu)]
 
 # template = 'ffmpeg -loglevel panic -y -i {} -ar {} -f wav {}'
 template2 = 'ffmpeg -hide_banner -loglevel panic -threads 1 -y -i {} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {}'
@@ -80,8 +82,15 @@ def fix_frame_rotation(image, rotation):
 	return image
 
 
-def process_video_file(vfile, args, gpu_id):
+def get_fps(video_path):
+	video_capture = cv2.VideoCapture(video_path)
+	fps = int(video_capture.get(cv2.CAP_PROP_FPS))
+	video_capture.release()
 
+	return fps
+
+
+def process_video_file(vfile, args, gpu_id):
 	vidname = os.path.basename(vfile).split('.')[0]
 	user_id = vfile.split('/')[-2]
 	# split = vfile.split('/')[-2]
@@ -89,6 +98,19 @@ def process_video_file(vfile, args, gpu_id):
 	# fulldir = path.join(args.preprocessed_root, word, split, vidname)
 	fulldir = path.join(args.preprocessed_root, user_id, vidname)
 	os.makedirs(fulldir, exist_ok=True)
+
+	# convert FPS is applicable
+	convert_fps = args.fps and args.fps != get_fps(vfile)
+	if convert_fps:
+		print('Original FPS:', get_fps(vfile))
+		tmp_vfile = vfile.replace('.mp4', f'-{args.fps}fps.mp4')
+		subprocess.call(VIDEO_CONVERT_FPS_COMMAND.format(
+			input_video_path=vfile,
+			output_video_path=tmp_vfile,
+			fps=args.fps
+		), shell=True)
+		vfile = tmp_vfile
+		print('New FPS:', get_fps(vfile))
 
 	# copy original video
 	if args.copy_original_video:
@@ -184,6 +206,9 @@ def process_video_file(vfile, args, gpu_id):
 		lip_movement_embeddings = get_lip_movement_embedding(ark_matrix)
 		np.savez_compressed(path.join(fulldir, 'video_ref.npz'), ref=lip_movement_embeddings)
 
+	if convert_fps:
+		os.remove(vfile)
+
 
 def process_audio_file(vfile, args, gpu_id):
 	vidname = os.path.basename(vfile).split('.')[0]
@@ -221,7 +246,7 @@ def main(args):
 	# filelist = glob(path.join(args.data_root, '*/{}/*.mp4'.format(args.split)))
 	# filelist = glob(path.join(args.data_root, '*.mp4'))
 	# filelist = glob(path.join(args.data_root, '*/*.mpg'))
-	filelist = glob(path.join(args.data_root, '*/*.mp4'))
+	filelist = list(glob(path.join(args.data_root, '*/*.mp4')))
 
 	print('Num videos:', len(list(filelist)))
 

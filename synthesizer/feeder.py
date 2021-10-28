@@ -169,8 +169,8 @@ class Feeder:
 		if window_fnames is None:
 			return None
 
-		# mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['mel'].T
-		mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['spec'].T
+		mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['mel'].T
+		# mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['spec'].T
 		mel = self.crop_audio_window(mel, img_name)
 		if mel.shape[0] != self._hparams.mel_step_size:
 			return None
@@ -244,8 +244,8 @@ class Feeder:
 				idx = np.random.randint(len(self.filelist[split]))
 				continue
 
-			# mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['mel'].T
-			mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['spec'].T
+			mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['mel'].T
+			# mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['spec'].T
 			mel = self.crop_audio_window(mel, img_name)
 			if (mel.shape[0] != self._hparams.mel_step_size):
 				idx = np.random.randint(len(self.filelist[split]))
@@ -283,8 +283,8 @@ class Feeder:
 			if window_fnames is None:
 				continue
 
-			# mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['mel'].T
-			mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['spec'].T
+			mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['mel'].T
+			# mel = np.load(os.path.join(os.path.dirname(img_name), 'mels.npz'))['spec'].T
 			mel = self.crop_audio_window(mel, img_name)
 			if mel.shape[0] != self._hparams.mel_step_size:
 				continue

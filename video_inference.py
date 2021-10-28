@@ -24,7 +24,7 @@ FFMPEG_OPTIONS = '-hide_banner -loglevel panic'
 VIDEO_TO_AUDIO_COMMAND = f'ffmpeg {FFMPEG_OPTIONS} -threads 1 -y -i {{video_path}} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {{audio_path}}'
 VIDEO_CONVERT_FPS_COMMAND = f'ffmpeg {FFMPEG_OPTIONS} -y -i {{input_video_path}} -strict -2 -filter:v fps=fps=25 {{output_video_path}}'
 VIDEO_REMOVE_AUDIO_COMMAND = f'ffmpeg {FFMPEG_OPTIONS} -i {{input_video_path}} -c copy -an {{output_video_path}}'
-VIDEO_ADD_AUDIO_COMMAND = f'ffmpeg {FFMPEG_OPTIONS} -i {{input_video_path}} -i {{input_audio_path}} -c copy -map 0:v:0 -map 1:a:0 {{output_video_path}}'
+VIDEO_ADD_AUDIO_COMMAND = f'ffmpeg {FFMPEG_OPTIONS} -i {{input_video_path}} -i {{input_audio_path}} -strict -2 -c:v copy -c:a aac {{output_video_path}}'
 SECS = 1
 
 fa = face_detection.FaceAlignment(face_detection.LandmarksType._2D, flip_input=False)
@@ -68,18 +68,21 @@ def fix_frame_rotation(image, rotation):
     return image
 
 
-def preprocess_video_file(video_path, output_directory, batch_size, fps=None):
+def preprocess_video_file(video_path, output_directory, batch_size, fps=None, neutral_audio_path=None,
+                          empty_audio_embedding=False):
     if os.path.exists(output_directory):
         shutil.rmtree(output_directory)
     os.makedirs(output_directory)
 
+    new_video_path = os.path.join(output_directory, f'original_video.mp4')
     if fps:
-        new_video_path = video_path.replace('.mp4', '_25fps.mp4')
-        subprocess.call(VIDEO_CONVERT_FPS.format(
+        subprocess.call(VIDEO_CONVERT_FPS_COMMAND.format(
             input_video_path=video_path,
             output_video_path=new_video_path
         ), shell=True)
-        video_path = new_video_path
+    else:
+        shutil.copyfile(video_path, new_video_path)
+    video_path = new_video_path
 
     video_stream = cv2.VideoCapture(video_path)
     video_rotation = get_video_rotation(video_path)
@@ -94,15 +97,17 @@ def preprocess_video_file(video_path, output_directory, batch_size, fps=None):
         frame = fix_frame_rotation(frame, video_rotation)
         frames.append(frame)
 
-    # convert video to audio
-    audio_path = os.path.join(output_directory, 'audio.wav')
-    subprocess.call(VIDEO_TO_AUDIO_COMMAND.format(
-        video_path=video_path,
-        audio_path=audio_path
-    ), shell=True)
-
-    if fps:
-        os.remove(video_path)
+    # don't extract audio if using empty audio embedding
+    if not empty_audio_embedding:
+        audio_path = os.path.join(output_directory, 'audio.wav')
+        if neutral_audio_path:
+            shutil.copyfile(neutral_audio_path, audio_path)
+        else:
+            # extract audio from video
+            subprocess.call(VIDEO_TO_AUDIO_COMMAND.format(
+                video_path=video_path,
+                audio_path=audio_path
+            ), shell=True)
 
     # get face detections and crop faces to disk
     batches = [frames[i:i + batch_size] for i in range(0, len(frames), batch_size)]
@@ -116,16 +121,21 @@ def preprocess_video_file(video_path, output_directory, batch_size, fps=None):
                 continue
 
             cv2.imwrite(os.path.join(output_directory, '{}.jpg'.format(i)), f[0])
-
-    # get speaker embedding for audio
-    wav = audio_encoder.audio.preprocess_wav(audio_path)
-    if len(wav) < SECS * audio_encoder.audio.sampling_rate:
-        return False
+    if i == -1:
+        return False  # no face detections
 
     embeddings_path = os.path.join(output_directory, 'ref.npz')
-    indices = np.random.choice(len(wav) - audio_encoder.audio.sampling_rate * SECS, 1)  # gets 1 random number
-    wavs = [wav[idx: idx + audio_encoder.audio.sampling_rate * SECS] for idx in indices]  # 1 random sampled wav
-    embeddings = np.asarray([eif.embed_utterance(wav) for wav in wavs])  # 1 embedding
+    if empty_audio_embedding:
+        embeddings = np.asarray([np.zeros(256, dtype=np.float32)])
+    else:
+        # get speaker embedding for audio
+        wav = audio_encoder.audio.preprocess_wav(audio_path)  # resamples the audio if required
+        if len(wav) < SECS * audio_encoder.audio.sampling_rate:
+            return False
+
+        indices = np.random.choice(len(wav) - audio_encoder.audio.sampling_rate * SECS, 1)  # gets 1 random number
+        wavs = [wav[idx: idx + audio_encoder.audio.sampling_rate * SECS] for idx in indices]  # 1 random sampled wav
+        embeddings = np.asarray([eif.embed_utterance(wav) for wav in wavs])  # 1 embedding
     np.savez_compressed(embeddings_path, ref=embeddings)
 
     return True
@@ -147,7 +157,7 @@ def read_window(window_fnames):
     return images
 
 
-def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_video=False):
+def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_video=False, debug=False):
     image_paths = glob.glob(os.path.join(video_directory, '*.jpg'))
     till = (len(image_paths) // 5) * 5
     hp = sif.hparams
@@ -184,7 +194,7 @@ def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_vide
     sif.audio.save_wav(wav, generated_output_audio_path, sr=hp.sample_rate)
 
     if combine_audio_and_video:
-        original_video_path = f'{video_directory.parents[0].joinpath(video_directory.name)}.{video_format}'
+        original_video_path = video_directory.joinpath('original_video.mp4')
         tmp_video_path = str(video_directory.joinpath('tmp_video.mp4'))
         subprocess.call(VIDEO_REMOVE_AUDIO_COMMAND.format(
             input_video_path=str(original_video_path),
@@ -193,9 +203,15 @@ def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_vide
         subprocess.call(VIDEO_ADD_AUDIO_COMMAND.format(
             input_video_path=tmp_video_path,
             input_audio_path=generated_output_audio_path,
-            output_video_path=str(video_directory.joinpath('video.mp4'))
-        ))
+            output_video_path=str(video_directory.joinpath('generated_video.mp4'))
+        ), shell=True)
         os.remove(tmp_video_path)
+
+    if not debug:
+        # remove unnecessary files
+        os.remove(embeddings_path)
+        for image_path in image_paths:
+            os.remove(image_path)
 
 
 def get_stats(video_directory):
@@ -227,7 +243,8 @@ def main(args):
             output_directories.append(output_directory)
             continue
 
-        success = preprocess_video_file(str(video_path), output_directory, args.batch_size, args.fps)
+        success = preprocess_video_file(str(video_path), output_directory, args.batch_size, args.fps,
+                                        args.neutral_audio_path, args.empty_audio_embedding)
         if success:
             output_directories.append(output_directory)
         else:
@@ -237,18 +254,24 @@ def main(args):
     global synthesizer
     synthesizer = sif.Synthesizer(verbose=False)
     for output_directory in tqdm(output_directories):
-        speech_synthesis(output_directory, args.video_format, args.combine_audio_and_video)
+        speech_synthesis(output_directory, args.video_format, args.combine_audio_and_video, args.debug)
 
-    # generate stats for all the videos
-    av_stoi, av_estoi = 0, 0
-    for output_directory in tqdm(output_directories):
-        stoi, estoi = get_stats(output_directory)
-        av_stoi += stoi
-        av_estoi += estoi
-    av_stoi /= len(output_directories)
-    av_estoi /= len(output_directories)
-    print('Av. STOI:', av_stoi)
-    print('Av. ESTOI:', av_estoi)
+    # don't generate stats if using a neutral audio embedding
+    if not args.neutral_audio_path and not args.empty_audio_embedding:
+        # generate stats for all the videos
+        av_stoi, av_estoi = 0, 0
+        for output_directory in tqdm(output_directories):
+            stoi, estoi = get_stats(output_directory)
+            av_stoi += stoi
+            av_estoi += estoi
+        av_stoi /= len(output_directories)
+        av_estoi /= len(output_directories)
+        print('Av. STOI:', av_stoi)
+        print('Av. ESTOI:', av_estoi)
+
+        with videos_directory.joinpath('stats.txt').open('w') as f:
+            f.write(f'Av. STOI: {av_stoi}\n'
+                    f'Av. ESTOI: {av_estoi}')
 
 
 if __name__ == '__main__':
@@ -260,5 +283,8 @@ if __name__ == '__main__':
     parser.add_argument('--redo', action='store_true')
     parser.add_argument('--video_format', default='mp4')
     parser.add_argument('--combine_audio_and_video', action='store_true')
+    parser.add_argument('--neutral_audio_path')  # for extracting a neutral audio embedding
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--empty_audio_embedding', action='store_true')
 
     main(parser.parse_args())

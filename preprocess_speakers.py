@@ -44,11 +44,10 @@ def process_video_file(afile, args):
 	# all_embeddings = np.asarray(all_embeddings)
 	# print(all_embeddings.shape)
 
-	# wav = sa.load_wav(afile, sr=hp.hparams.sample_rate)
-	# lspec = sa.linearspectrogram(wav, hp.hparams)
-	# melspec = sa.melspectrogram(wav, hp.hparams)
-	#
-	# np.savez_compressed(afile.replace('audio.wav', 'mels.npz'), lspec=lspec, mel=melspec)
+	wav = sa.load_wav(afile, sr=hp.hparams.sample_rate)
+	lspec = sa.linearspectrogram(wav, hp.hparams)
+	melspec = sa.melspectrogram(wav, hp.hparams)
+	np.savez_compressed(afile.replace('audio.wav', 'mels.npz'), lspec=lspec, mel=melspec)
 
 def mp_handler(job):
 	vfile, args = job
@@ -62,9 +61,9 @@ def mp_handler(job):
 def dump(args):
 	print('Started processing for with {} CPU cores'.format(args.num_workers))
 
-	filelist = glob(path.join(args.preprocessed_root, '*', '*', '*', 'audio.wav'))
+	# filelist = glob(path.join(args.preprocessed_root, '*', '*', '*', 'audio.wav'))
 	# filelist = glob(path.join(args.preprocessed_root, '*.wav'))
-	# filelist = glob(path.join(args.preprocessed_root, '*', '*', 'audio.wav'))
+	filelist = list(glob(path.join(args.preprocessed_root, '*', '*', 'audio.wav')))
 
 	jobs = [(vfile, args) for vfile in filelist]
 	p = ThreadPoolExecutor(args.num_workers)
