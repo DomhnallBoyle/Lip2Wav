@@ -27,4 +27,4 @@ Unidecode
 visdom
 webrtcvad
 youtube-dl
-torch==1.1.0
+torch==1.6

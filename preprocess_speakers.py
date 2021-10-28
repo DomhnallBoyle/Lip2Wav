@@ -25,7 +25,7 @@ def process_video_file(afile, args):
 	wav = audio_encoder.audio.preprocess_wav(afile)
 	if len(wav) < secs * audio_encoder.audio.sampling_rate:
 		# print(len(wav), '<', secs * audio_encoder.audio.sampling_rate)
-		shutil.rmtree(path.dirname(afile))
+		# shutil.rmtree(path.dirname(afile))
 		return
 
 	# get speaker embedding for audio
