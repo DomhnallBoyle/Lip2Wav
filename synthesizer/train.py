@@ -157,7 +157,6 @@ def train(log_dir, args, hparams):
     
     # Book keeping
     step = 0
-    num_train_batches = 0
     time_window = ValueWindow(100)
     loss_window = ValueWindow(100)
     saver = tf.train.Saver(max_to_keep=2)
@@ -211,9 +210,8 @@ def train(log_dir, args, hparams):
             
             # Training loop
             while not coord.should_stop() and step < args.tacotron_train_steps:
-                if num_train_batches == 0:
-                    feeder.set_train_feeding_status(True)
-                    num_train_batches += _batches_per_group
+
+                feeder.dequeue_training_sample()
 
                 start_time = time.time()
                 step, loss, opt = sess.run([global_step, model.loss, model.optimize])
@@ -223,19 +221,16 @@ def train(log_dir, args, hparams):
                     step, time_window.average, loss, loss_window.average)
                 log(message, end="\r", slack=(step % args.checkpoint_interval == 0))
 
-                num_train_batches -= 1
-
                 if loss > 100 or np.isnan(loss):
                     log("Loss exploded to {:.5f} at step {}".format(loss, step))
                     raise Exception("Loss exploded")
 
-                if step % args.summary_interval == 0:
+                if step == 100 or step % args.summary_interval == 0:
                     log("\nWriting summary at step {}".format(step))
-                    feeder.set_train_feeding_status(True)
+                    feeder.dequeue_training_sample()
                     summary_writer.add_summary(sess.run(stats), step)
-                    num_train_batches += (_batches_per_group - 1)  # added x, then takeaway 1
 
-                if step % args.eval_interval == 0:
+                if step == 100 or step % args.eval_interval == 0:
                     # Run eval and save eval stats
                     log("\nRunning evaluation at step {}".format(step))
 
@@ -365,8 +360,8 @@ def train(log_dir, args, hparams):
                     add_eval_stats(summary_writer, step, linear_loss, before_loss, after_loss, eval_loss, eval_stoi, eval_estoi)
 
                 if step % args.checkpoint_interval == 0 or step == args.tacotron_train_steps or step == 300:
-                    feeder.set_train_feeding_status(True)
-                    num_train_batches += _batches_per_group
+
+                    feeder.dequeue_training_sample()
 
                     # Save model and current global step
                     saver.save(sess, checkpoint_fpath, global_step=global_step)
@@ -380,8 +375,6 @@ def train(log_dir, args, hparams):
                         model.tower_targets_lengths[0][0],
                     ])
                     
-                    num_train_batches -= 1
-
                     # save predicted mel spectrogram to disk (debug)
                     mel_filename = "mel-prediction-step-{}.npy".format(step)
                     np.save(os.path.join(mel_dir, mel_filename), mel_prediction.T,

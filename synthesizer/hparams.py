@@ -358,7 +358,15 @@ hparams = HParams(
     overlap=10,
     mel_overlap=32,
     mel_step_size=80,
-    img_size=128,
+    
+    # face ROI
+    # img_height=128,
+    # img_width=128,
+
+    # mouth ROI
+    img_height=50,
+    img_width=100,
+
     fps=25,
 )
 

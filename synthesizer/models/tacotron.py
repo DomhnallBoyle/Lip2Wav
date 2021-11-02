@@ -100,7 +100,7 @@ class Tacotron():
             batch_size = tf.shape(inputs)[0]
             mel_channels = hp.num_mels
             for i in range(hp.tacotron_num_gpus):
-                tower_inputs.append(tf.reshape(p_inputs[i], [batch_size, hparams.T, hparams.img_size, hparams.img_size, 3]))
+                tower_inputs.append(tf.reshape(p_inputs[i], [batch_size, hparams.T, hparams.img_height, hparams.img_width, 3]))
                 if p_mel_targets is not None:
                     tower_mel_targets.append(
                         tf.reshape(p_mel_targets[i], [batch_size, -1, mel_channels]))

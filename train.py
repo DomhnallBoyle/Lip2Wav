@@ -25,8 +25,11 @@ def prepare_run(args):
     random.seed(seed)
     tf.random.set_random_seed(seed)
 
-    # all_images = get_image_list('test', args.data_root)
-    # all_test_images = get_image_list('test', args.data_root)
+    """
+    LRW:
+    """
+    all_training_images = get_image_list('train', args.data_root)
+    all_test_images = get_image_list('val', args.data_root)
 
     """
     GRID:
