@@ -1,6 +1,8 @@
 audioread==2.1.8
+google-cloud-speech==2.11.1
 h5py==2.9.0
 inflect
+jiwer==2.3.0
 librosa==0.7.0
 lws==1.2.6
 Markdown==3.1.1

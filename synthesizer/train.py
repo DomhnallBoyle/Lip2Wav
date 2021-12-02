@@ -142,13 +142,16 @@ def train(log_dir, args, hparams):
     log(hparams_debug_string())
     log(args.__dict__)
 
-    # Start by setting a seed for repeatability
-    tf.set_random_seed(hparams.tacotron_random_seed)
-    
     # Set up data feeder
     coord = tf.train.Coordinator()
     with tf.variable_scope("datafeeder") as scope:
-        feeder = Feeder(coord, hparams, args.num_test_batches)
+        feeder = Feeder(
+            coord,
+            hparams,
+            num_test_batches=args.num_test_batches,
+            apply_augmentation=args.apply_augmentation,
+            lrw=args.dataset == 'LRW'
+        )
     
     # Set up model:
     global_step = tf.Variable(0, name="global_step", trainable=False)
@@ -205,9 +208,9 @@ def train(log_dir, args, hparams):
             
             # initializing feeder
             feeder.start_threads(sess)
-            print ("Feeder is initialized....")
-            print ("Ready to train....")
-            
+            print("Feeder is initialized....")
+            print("Ready to train....")
+
             # Training loop
             while not coord.should_stop() and step < args.tacotron_train_steps:
 

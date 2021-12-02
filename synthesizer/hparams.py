@@ -360,14 +360,16 @@ hparams = HParams(
     mel_step_size=80,
     
     # face ROI
-    # img_height=128,
-    # img_width=128,
+    img_height=128,
+    img_width=128,
 
-    # mouth ROI
-    img_height=50,
-    img_width=100,
+    # # mouth ROI
+    # img_height=50,
+    # img_width=100,
 
     fps=25,
+
+    augmentation_prob=0.5
 )
 
 

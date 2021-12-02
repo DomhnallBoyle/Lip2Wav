@@ -26,17 +26,7 @@ import shutil
 import torch
 import time
 
-parser = argparse.ArgumentParser()
-
-parser.add_argument('--ngpu', help='Number of GPUs across which to run in parallel', default=1, type=int)
-parser.add_argument('--batch_size', help='Single GPU Face detection batch size', default=32, type=int)
-parser.add_argument("--data_root", help="Root folder of the LRW dataset", required=True)
-parser.add_argument("--preprocessed_root", help="Root folder of the preprocessed dataset", required=True)
-parser.add_argument("--split", help="* | train | val | test (* will preprocess all splits)", default="test",
-                    choices=["*", "train", "val", "test"])
-
-
-args = parser.parse_args()
+# from video_inference import VIDEO_TO_AUDIO_COMMAND
 
 # fa = [face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=False,
 #                                    device='cpu') for _ in range(args.ngpu)]  # S3FD face detectors CPU
@@ -52,8 +42,6 @@ fa = face_alignment.FaceAlignment(face_alignment.LandmarksType._2D, flip_input=F
 face_detector = dlib.get_frontal_face_detector()
 shape_predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
 
-# template = 'ffmpeg -loglevel panic -y -i {} -ar {} -f wav {}'
-template2 = 'ffmpeg -hide_banner -loglevel panic -threads 1 -y -i {} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {}'
 
 """3 ways of face and landmark detection:
 1: DLIB detector (CPU) and DLIB landmarks (CPU) - very fast w/ multiple cores
@@ -198,8 +186,11 @@ def process_video_file(vfile, args, gpu_id, detector='dlib'):
     wavpath = path.join(fulldir, 'audio.wav')
     specpath = path.join(fulldir, 'mels.npz')
 
-    command = template2.format(vfile, wavpath)
-    result = subprocess.call(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    command = VIDEO_TO_AUDIO_COMMAND.format(
+        input_video_path=vfile,
+        output_audio_path=wavpath
+    )
+    subprocess.call(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
     # this works and is super fast because of multiple CPU cores
     if detector == 'dlib':
@@ -215,6 +206,7 @@ def process_video_file(vfile, args, gpu_id, detector='dlib'):
         cv2.imwrite(path.join(fulldir, '{}.jpg'.format(i)), mouth_frame)
 
     return True
+
 
 def process_audio_file(vfile, args, gpu_id):
     vidname = os.path.basename(vfile).split('.')[0]
@@ -322,4 +314,15 @@ def main(args):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--ngpu', help='Number of GPUs across which to run in parallel', default=1, type=int)
+    parser.add_argument('--batch_size', help='Single GPU Face detection batch size', default=32, type=int)
+    parser.add_argument("--data_root", help="Root folder of the LRW dataset", required=True)
+    parser.add_argument("--preprocessed_root", help="Root folder of the preprocessed dataset", required=True)
+    parser.add_argument("--split", help="* | train | val | test (* will preprocess all splits)", default="test",
+                        choices=["*", "train", "val", "test"])
+
+    args = parser.parse_args()
+
     main(args)
