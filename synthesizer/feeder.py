@@ -13,6 +13,7 @@ import cv2
 import glob
 import time
 
+from sample_pool import SamplePool
 
 _batches_per_group = 4
 test_feeding_status, load_next_test_sample = False, False
@@ -25,7 +26,9 @@ class Feeder:
     Feeds batches of data into queue on a background thread.
     """
 
-    def __init__(self, coordinator, hparams, num_test_batches, apply_augmentation=False, lrw=False):
+    def __init__(self, coordinator, hparams, num_test_batches, apply_augmentation=False, lrw=False,
+                 training_sample_pool_location='/tmp/training_sample_pool',
+                 val_sample_pool_location='/tmp/val_sample_pool'):
         super(Feeder, self).__init__()
         self._coord = coordinator
         self._hparams = hparams
@@ -33,10 +36,12 @@ class Feeder:
         self._test_offset = 0
         self.num_test_batches = num_test_batches
 
-        self.filelist = {'train': self._hparams.all_images,
-                         'test': self._hparams.all_test_images}
+        # self.filelist = {'train': self._hparams.all_images,
+        #                  'test': self._hparams.all_test_images}
 
-        self.test_steps = 2
+        self.training_sample_pool_location = training_sample_pool_location
+        self.val_sample_pool_location = val_sample_pool_location
+
         self.apply_augmentation = apply_augmentation
         self.lrw = lrw
 
@@ -179,48 +184,97 @@ class Feeder:
         return batches
 
     def _enqueue_next_train_group(self):
+        # global num_queued_batches
+        # num_queued_batches = 0
+        # num_batches = _batches_per_group
+        # batch_size = self._hparams.tacotron_batch_size
+        # r = self._hparams.outputs_per_step
+        #
+        # selection_weights = self.get_selection_weights(split='train')
+        #
+        # while not self._coord.should_stop():
+        #     while num_queued_batches != num_batches:
+        #         start = time.time()
+        #
+        #         image_paths = self.get_image_paths(split='train', num_samples=batch_size,
+        #                                            selection_weights=selection_weights)
+        #
+        #         batch = [self.get_item(img_name=image_path, split='train')
+        #                  for image_path in image_paths]
+        #         # bucket samples based on similar output sequence length for efficiency
+        #         batch.sort(key=lambda x: x[-1])
+        #
+        #         log(f'Generated 1 train batch of size {len(batch)} in {time.time() - start:.3f} sec')
+        #         feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
+        #         self._session.run(self._enqueue_op, feed_dict=feed_dict)
+        #         num_queued_batches += 1
+        #         log(f'Num queued batches: {num_queued_batches}')
+        #     time.sleep(0.1)
+
         global num_queued_batches
         num_queued_batches = 0
         num_batches = _batches_per_group
         batch_size = self._hparams.tacotron_batch_size
         r = self._hparams.outputs_per_step
-
-        selection_weights = self.get_selection_weights(split='train')
+        sample_pool = SamplePool(location=self.training_sample_pool_location)
 
         while not self._coord.should_stop():
             while num_queued_batches != num_batches:
                 start = time.time()
-
-                image_paths = self.get_image_paths(split='train', num_samples=batch_size,
-                                                   selection_weights=selection_weights)
-
-                batch = [self.get_item(img_name=image_path, split='train')
-                         for image_path in image_paths]
+                batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=True)]
+                if not batch:
+                    time.sleep(0.1)
+                    continue
                 # bucket samples based on similar output sequence length for efficiency
                 batch.sort(key=lambda x: x[-1])
 
-                log(f'Generated 1 train batch of size {len(batch)} in {time.time() - start:.3f} sec')
                 feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
                 self._session.run(self._enqueue_op, feed_dict=feed_dict)
                 num_queued_batches += 1
+
+                log(f'Generated 1 train batch of size {len(batch)} in {time.time() - start:.3f} sec')
                 log(f'Num queued batches: {num_queued_batches}')
             time.sleep(0.1)
 
     def _enqueue_next_test_group(self):
+        # global test_feeding_status, load_next_test_sample
+        # test_batch_pool, r = self.make_test_batches(
+        #     batch_size=self._hparams.tacotron_batch_size,
+        #     num_batches=1000
+        # )  # loads image paths to save memory
+        # r = self._hparams.outputs_per_step
+        # while not self._coord.should_stop():
+        #     if test_feeding_status:  # begin testing time
+        #         i = 0
+        #         test_batches = np.random.choice(test_batch_pool, self.num_test_batches)  # pick random batch from pool
+        #         while i < self.num_test_batches:
+        #             if load_next_test_sample:
+        #                 batch = test_batches[i]
+        #                 batch = [self.get_item(img_name=img_name, split='test') for img_name in batch]
+        #                 np.random.shuffle(batch)  # shuffle the batch to get different saved output
+        #                 feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
+        #                 self._session.run(self._eval_enqueue_op, feed_dict=feed_dict)
+        #                 i += 1
+        #                 load_next_test_sample = False
+        #             time.sleep(0.1)
+        #         log(f'Queued Test batches: {i}')
+        #         test_feeding_status = False
+        #     time.sleep(0.1)
+
         global test_feeding_status, load_next_test_sample
-        test_batch_pool, r = self.make_test_batches(
-            batch_size=self._hparams.tacotron_batch_size,
-            num_batches=1000
-        )  # loads image paths to save memory
+        batch_size = self._hparams.tacotron_batch_size
         r = self._hparams.outputs_per_step
+        sample_pool = SamplePool(location=self.val_sample_pool_location)
+
         while not self._coord.should_stop():
             if test_feeding_status:  # begin testing time
                 i = 0
-                test_batches = np.random.choice(test_batch_pool, self.num_test_batches)  # pick random batch from pool
                 while i < self.num_test_batches:
                     if load_next_test_sample:
-                        batch = test_batches[i]
-                        batch = [self.get_item(img_name=img_name, split='test') for img_name in batch]
+                        batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=True)]
+                        if not batch:
+                            time.sleep(0.1)
+                            continue
                         np.random.shuffle(batch)  # shuffle the batch to get different saved output
                         feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
                         self._session.run(self._eval_enqueue_op, feed_dict=feed_dict)

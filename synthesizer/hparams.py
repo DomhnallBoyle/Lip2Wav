@@ -284,7 +284,7 @@ hparams = HParams(
     # boolean, determines if the learning rate will follow an exponential decay
     # tacotron_start_decay=150000,  # Step at which learning decay starts
     # tacotron_decay_steps=50000,  # Determines the learning rate decay slope (UNDER TEST)
-    tacotron_start_decay=313000,
+    tacotron_start_decay=1000000,
     tacotron_decay_steps=50000,
     tacotron_decay_rate=0.5,  # learning rate decay rate (UNDER TEST)
     tacotron_initial_learning_rate=1e-3,  # starting learning rate
@@ -377,7 +377,7 @@ def hparams_debug_string():
     values = hparams.values()
     hp = ["  %s: %s" % (name, values[name]) for name in sorted(values)
           if name not in ["sentences", 'all_images', 'all_test_images']]
-    hp += [f'Num Train Images: {len(values["all_images"])}']
-    hp += [f'Num Test Images: {len(values["all_test_images"])}']
+    # hp += [f'Num Train Images: {len(values["all_images"])}']
+    # hp += [f'Num Test Images: {len(values["all_test_images"])}']
 
     return "Hyperparameters:\n" + "\n".join(hp)

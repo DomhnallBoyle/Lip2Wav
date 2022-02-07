@@ -144,13 +144,15 @@ def train(log_dir, args, hparams):
 
     # Set up data feeder
     coord = tf.train.Coordinator()
-    with tf.variable_scope("datafeeder") as scope:
+    with tf.variable_scope('datafeeder') as scope:
         feeder = Feeder(
             coord,
             hparams,
             num_test_batches=args.num_test_batches,
             apply_augmentation=args.apply_augmentation,
-            lrw=args.dataset == 'LRW'
+            lrw=args.dataset == 'LRW',
+            training_sample_pool_location=args.training_sample_pool_location,
+            val_sample_pool_location=args.val_sample_pool_location
         )
     
     # Set up model:
@@ -222,7 +224,7 @@ def train(log_dir, args, hparams):
                 loss_window.append(loss)  # loss appended after every step (keeps window of 100 losses)
                 message = "Step {:7d} [{:.3f} sec/step, loss={:.5f}, avg_loss={:.5f}]".format(
                     step, time_window.average, loss, loss_window.average)
-                log(message, end="\r", slack=(step % args.checkpoint_interval == 0))
+                log(message, end="\r")
 
                 if loss > 100 or np.isnan(loss):
                     log("Loss exploded to {:.5f} at step {}".format(loss, step))
@@ -274,6 +276,11 @@ def train(log_dir, args, hparams):
 
                     else:
                         feeder.set_test_feeding_status(True)
+                        # TODO: Race condition here
+                        #  worker: if i = 15 (< 16), batch loaded
+                        #  main: unload + calc stois, goes back into loop (True), wait for next batch to be loaded
+                        #  worker: i = 16 (== 16), breaks loading while, never loads next batch
+                        #  stuck main thread waiting for batch
                         while feeder.get_test_feeding_status():
                             feeder.set_load_next_test_sample(True)  # load next batch
                             # this executes a batch at a time
