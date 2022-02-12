@@ -205,7 +205,7 @@ def prepare_run(args):
     # hparams.add_hparam('all_images', all_training_images)
     # hparams.add_hparam('all_test_images', all_test_images)
     hparams.set_hparam('tacotron_batch_size', args.batch_size)
-    args.num_test_batches = args.num_test_samples / args.batch_size
+    args.num_test_batches = args.num_test_samples // args.batch_size
 
     # print('Training on {} hours'.format(len(all_training_images) / (3600. * hparams.fps)))
     # print('Validating on {} hours'.format(len(all_test_images) / (3600. * hparams.fps)))
@@ -243,7 +243,7 @@ if __name__ == "__main__":
     parser.add_argument('log_number', type=int)
     parser.add_argument('--num_test_samples', type=int, default=512)
     parser.add_argument('--checkpoint_path')
-    parser.add_argument('dataset', choices=['LRW', 'GRID', 'SRAVI'])
+    parser.add_argument('dataset', choices=['LRW', 'LRS2', 'GRID', 'SRAVI'])
     parser.add_argument('--videos_root')
     parser.add_argument('--apply_augmentation', action='store_true')
     parser.add_argument('--batch_size', type=int, default=32)
@@ -251,6 +251,7 @@ if __name__ == "__main__":
     parser.add_argument('--image_width', type=int, default=128)
     parser.add_argument('--training_sample_pool_location', default='/tmp/training_sample_pool')
     parser.add_argument('--val_sample_pool_location', default='/tmp/val_sample_pool')
+    parser.add_argument('--use_selection_weights', action='store_true')
 
     args = parser.parse_args()
     log_dir, hparams = prepare_run(args)

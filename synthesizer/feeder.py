@@ -28,7 +28,8 @@ class Feeder:
 
     def __init__(self, coordinator, hparams, num_test_batches, apply_augmentation=False, lrw=False,
                  training_sample_pool_location='/tmp/training_sample_pool',
-                 val_sample_pool_location='/tmp/val_sample_pool'):
+                 val_sample_pool_location='/tmp/val_sample_pool', 
+                 use_selection_weights=False):
         super(Feeder, self).__init__()
         self._coord = coordinator
         self._hparams = hparams
@@ -41,6 +42,7 @@ class Feeder:
 
         self.training_sample_pool_location = training_sample_pool_location
         self.val_sample_pool_location = val_sample_pool_location
+        self.use_selection_weights = use_selection_weights
 
         self.apply_augmentation = apply_augmentation
         self.lrw = lrw
@@ -150,7 +152,7 @@ class Feeder:
         return selection_weights
 
     def get_image_paths(self, split, num_samples, selection_weights=None):
-        if not selection_weights:
+        if self.use_selection_weights and not selection_weights:
             selection_weights = self.get_selection_weights(split=split)
 
         image_paths = []
@@ -168,12 +170,13 @@ class Feeder:
 
         image_paths = self.get_image_paths(split='test', num_samples=batch_size * num_batches)
 
-        # check selected sample counts
-        speaker_counts = {}
-        for image_path in image_paths:
-            speaker_id = image_path.split('/')[-3]
-            speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
-        log(f'Validation speaker counts: {speaker_counts}')
+        if self.use_selection_weights:
+            # check selected sample counts
+            speaker_counts = {}
+            for image_path in image_paths:
+                speaker_id = image_path.split('/')[-3]
+                speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+            log(f'Validation speaker counts: {speaker_counts}')
 
         batches = [image_paths[i: i+batch_size]
                    for i in range(0, len(image_paths), batch_size)]
@@ -181,7 +184,7 @@ class Feeder:
         log('\nGenerated %d test batches of size %d in %.3f sec' %
             (len(batches), batch_size, time.time() - start))
 
-        return batches
+        return np.asarray(batches)
 
     def _enqueue_next_train_group(self):
         # global num_queued_batches
@@ -221,7 +224,7 @@ class Feeder:
         while not self._coord.should_stop():
             while num_queued_batches != num_batches:
                 start = time.time()
-                batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=True)]
+                batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=self.use_selection_weights)]
                 if not batch:
                     time.sleep(0.1)
                     continue
@@ -271,7 +274,7 @@ class Feeder:
                 i = 0
                 while i < self.num_test_batches:
                     if load_next_test_sample:
-                        batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=True)]
+                        batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=self.use_selection_weights)]
                         if not batch:
                             time.sleep(0.1)
                             continue

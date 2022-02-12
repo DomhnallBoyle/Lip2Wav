@@ -92,6 +92,7 @@ def main(args):
             continue
 
         video_path, video_frames, mel_spec, speaker_embeddings = pickle.loads(preprocessed_obj)
+        _class = video_path.split('/')[-2] if args.group_by_class else None
 
         # use all embeddings associated with a video to create multiple samples
         for speaker_embedding in speaker_embeddings:
@@ -121,7 +122,7 @@ def main(args):
             video_frames_window = (np.asarray(video_frames_window) / 255.).astype(np.float32)
 
             sample = [video_path, video_frames_window, mel_spec_window, speaker_embedding, len(mel_spec_window)]
-            sample_pool.write(sample, _class=video_path.split('/')[-2], max_size=args.max_sample_pool_size)
+            sample_pool.write(sample, _class=_class, max_size=args.max_sample_pool_size)
 
 
 if __name__ == '__main__':
@@ -136,6 +137,7 @@ if __name__ == '__main__':
     parser.add_argument('--redis_port', type=int, default=6379)
     parser.add_argument('--pull_list_name', default='preprocessed_list')
     parser.add_argument('--lrw', action='store_true')
+    parser.add_argument('--group_by_class', action='store_true')
     parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())

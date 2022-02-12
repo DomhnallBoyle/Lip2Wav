@@ -16,7 +16,7 @@ class SamplePool:
             shutil.rmtree(str(self.location))
         self.location.mkdir(exist_ok=True)
 
-    def write(self, obj, _class, max_size=500):
+    def write(self, obj, _class=None, max_size=500):
         # write sample to file, delete random sample if overloaded
         # eventually, class with the most samples in the pool will be more likely overwritten
 
@@ -29,8 +29,12 @@ class SamplePool:
             random_index = random.randint(0, num_samples - 1)  # inclusive
             sample_to_remove = sample_paths[random_index]
             os.remove(str(sample_to_remove))
+        
+        save_name = f'{str(uuid.uuid4())}.npz'
+        if _class: 
+            save_name = f'{_class}_' + save_name
 
-        np.savez_compressed(str(self.location.joinpath(f'{_class}_{str(uuid.uuid4())}.npz')), sample=obj)
+        np.savez_compressed(str(self.location.joinpath(save_name)), sample=obj)
 
     def read(self, count, use_selection_weights=False):
         pool_size = self.size()

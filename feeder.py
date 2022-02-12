@@ -34,8 +34,20 @@ def main(args):
     dataset = args.dataset
     redis_server = redis.Redis(host=args.redis_host, port=args.redis_port)
 
-    if dataset == 'LRW':
+    if dataset in ['LRW', 'GENERIC']:
         video_paths = list(videos_root.glob(args.videos_glob_path))
+    elif dataset == 'LRS2':
+        if not args.samples_text_file:
+            video_paths = list(videos_root.glob(args.videos_glob_path))
+        else:
+            video_paths = []
+            with open(args.samples_text_file, 'r') as f:
+                samples = f.read().splitlines()
+            for sample in samples:
+                video_path = videos_root.joinpath(f'{sample}.mp4')
+                if not video_path.exists():
+                    continue
+                video_paths.append(video_path)
     elif dataset == 'SRAVI':
         # requires videos root to contain data captures with speaker directories
         # or just the speaker directories
@@ -125,6 +137,11 @@ def main(args):
         print('Dataset doesn\'t exist')
         exit()
 
+    if args.clear_push_list:
+        redis_server.delete(args.push_list_name)
+
+    print('Num video paths in list:', redis_server.llen(args.push_list_name))
+
     for video_path in video_paths:
         redis_server.rpush(args.push_list_name, str(video_path))
 
@@ -141,20 +158,28 @@ if __name__ == '__main__':
     parser.add_argument('--redis_host', default='redis')
     parser.add_argument('--redis_port', type=int, default=6379)
     parser.add_argument('--push_list_name', default='feed_list')
+    parser.add_argument('--clear_push_list', action='store_true')
 
     sub_parsers = parser.add_subparsers(dest='dataset')
 
-    parser_1 = sub_parsers.add_parser('LRW')
-    parser_1.add_argument('--videos_glob_path', help='*/train/*.mp4')
+    parser_1 = sub_parsers.add_parser('GENERIC')
+    parser_1.add_argument('videos_glob_path', help='*/train/*.mp4')
 
-    parser_2 = sub_parsers.add_parser('SRAVI')
-    parser_2.add_argument('--data_captures', type=list_type)
-    parser_2.add_argument('--included_speakers', type=list_type)
-    parser_2.add_argument('--excluded_speakers', type=list_type)
-    parser_2.add_argument('--is_test_data', action='store_true')
+    parser_2 = sub_parsers.add_parser('LRW')
+    parser_2.add_argument('videos_glob_path', help='*/train/*.mp4')
 
-    parser_3 = sub_parsers.add_parser('GRID')
+    parser_3 = sub_parsers.add_parser('SRAVI')
+    parser_3.add_argument('--data_captures', type=list_type)
     parser_3.add_argument('--included_speakers', type=list_type)
     parser_3.add_argument('--excluded_speakers', type=list_type)
+    parser_3.add_argument('--is_test_data', action='store_true')
+
+    parser_4 = sub_parsers.add_parser('GRID')
+    parser_4.add_argument('--included_speakers', type=list_type)
+    parser_4.add_argument('--excluded_speakers', type=list_type)
+
+    parser_5 = sub_parsers.add_parser('LRS2')
+    parser_5.add_argument('--videos_glob_path', help='*/*.mp4')
+    parser_5.add_argument('--samples_text_file')
 
     main(parser.parse_args())

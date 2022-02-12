@@ -30,3 +30,7 @@ visdom
 webrtcvad
 youtube-dl
 torch==1.6
+pandas
+vidaug
+texttable
+lshashpy3

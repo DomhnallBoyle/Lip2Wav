@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -21,198 +22,13 @@ from google.cloud import speech
 from jiwer import wer as calculate_wer
 from tqdm import tqdm
 
-import audio_encoder.audio
-import face_detection
-from audio_encoder import inference as eif
-from lip_movement_encoder_utils import get_cfe_features, get_lip_movement_embedding as _get_lip_movement_embedding
-from preprocess_mouth_roi import s3fd_detector_and_pytorch_landmarks
-from similarity_search import query as lip_to_audio_query
+from audio_utils import crop_audio
+from preprocessor import process_video as preprocess_video
+from similarity_search import query as lip_query
 from synthesizer import inference as sif
-
-FFMPEG_OPTIONS = '-hide_banner -loglevel panic'
-OLD_FFMPEG_VERSION = f'ffmpeg-2.8.15'
-# this is a static build from https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz
-# contains x264 codec in build required for clean video frames
-NEW_FFMPEG_VERSION = f'/opt/lip2wav/ffmpeg-4.4.1-i686-static/ffmpeg'
-
-# VIDEO_TO_AUDIO_COMMAND = f'{OLD_FFMPEG_VERSION} {FFMPEG_OPTIONS} -threads 1 -y -i {{input_video_path}} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {{output_audio_path}}'
-VIDEO_TO_AUDIO_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -threads 1 -y -i {{input_video_path}} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {{output_audio_path}}'
-VIDEO_CONVERT_FPS_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -strict -2 -filter:v fps=fps={{fps}} {{output_video_path}}'  # copies original codecs and metadata (rotation)
-VIDEO_REMOVE_AUDIO_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -c copy -an {{output_video_path}}'
-VIDEO_ADD_AUDIO_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -i {{input_audio_path}} -strict -2 -c:v copy -c:a aac {{output_video_path}}'
-VIDEO_INFO_COMMAND = f'{NEW_FFMPEG_VERSION} -i {{input_video_path}}'
-AUDIO_COMBINE_COMMAND = f'sox {{input_audio_path_1}} {{input_audio_path_2}} {{output_audio_path}}'
-
-# denoising commands
-WAV_TO_PCM_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ac 1 -ar 48000 -f s16le -acodec pcm_s16le {{output_audio_path}}'  # 16-bit pcm w/ 48khz
-DENOISE_COMMAND = f'/opt/rnnoise/examples/rnnoise_demo {{input_audio_path}} {{output_audio_path}}'
-PCM_TO_WAV_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -f s16le -ar 48000 -ac 1 -i {{input_audio_path}} {{output_audio_path}}'
-WAV_TO_16KHZ_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ac 1 -vn -acodec pcm_s16le -ar 16000 {{output_audio_path}}'
-
-# normalise commands
-NORMALISE_AUDIO_COMMAND = f'ffmpeg-normalize -f -q {{input_audio_path}} -o {{output_audio_path}} -ar 16000'
-PAD_AUDIO_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -af "adelay={{delay}}000|{{delay}}000" {{output_audio_path}}'  # pads audio with delay seconds of silence
-REMOVE_AUDIO_PAD_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ss 00:00:{{delay}}.000 -acodec pcm_s16le {{output_audio_path}}'  # removes delay seconds of silence
-
-# lrw cropping commands
-CROP_AUDIO_COMMAND = f'{NEW_FFMPEG_VERSION} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ss 00:00:00.{{start_millis}} -t 00:00:00.{{duration_millis}} {{output_audio_path}}'
-
-SECS = 1
-
-fa = face_detection.FaceAlignment(face_detection.LandmarksType._2D, flip_input=False)
-
-encoder_weights = 'audio_encoder/saved_models/pretrained.pt'
-eif.load_model(encoder_weights)
+from video_utils import extract_audio, replace_audio
 
 synthesizer = None
-
-
-def get_lip_movement_embedding(video_path):
-    # NOTE: this is the DTW CFE which uses an old AE model
-    # the lip movement encoder was trained using arks from this
-    ark_matrix = get_cfe_features(video_path, 'https://51.144.138.184', '/shared/Repos/visual-dtw/azure_cfe.pem')
-    if ark_matrix is None:
-        return
-
-    return _get_lip_movement_embedding(ark_matrix)
-
-
-def get_video_rotation(video_path):
-    cmd = VIDEO_INFO_COMMAND.format(input_video_path=video_path)
-
-    p = subprocess.Popen(
-        cmd.split(' '),
-        stderr=subprocess.PIPE,
-        close_fds=True
-    )
-    stdout, stderr = p.communicate()
-
-    try:
-        reo_rotation = re.compile('rotate\s+:\s(\d+)')
-        match_rotation = reo_rotation.search(str(stderr))
-        rotation = match_rotation.groups()[0]
-    except AttributeError:
-        # print(f'Rotation not found: {video_path}')
-        return 0
-
-    return int(rotation)
-
-
-def fix_frame_rotation(image, rotation):
-    if rotation == 90:
-        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-    elif rotation == 180:
-        image = cv2.rotate(image, cv2.ROTATE_180)
-    elif rotation == 270:
-        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    return image
-
-
-def get_fps(video_path):
-    video_capture = cv2.VideoCapture(video_path)
-    fps = int(video_capture.get(cv2.CAP_PROP_FPS))
-    video_capture.release()
-
-    return fps
-
-
-def preprocess_video_file(video_path, output_directory, batch_size, mouth_roi=False, fps=None, _preprocess_audio=False,
-                          neutral_audio_path=None, empty_audio_embedding=False, closest_audio_embedding=False):
-    if os.path.exists(output_directory):
-        shutil.rmtree(output_directory)
-    os.makedirs(output_directory)
-
-    # convert FPS if applicable
-    new_video_path = os.path.join(output_directory, f'original_video.mp4')
-    if fps and fps != get_fps(video_path):
-        subprocess.call(VIDEO_CONVERT_FPS_COMMAND.format(
-            input_video_path=video_path,
-            output_video_path=new_video_path,
-            fps=fps
-        ), shell=True)
-        video_rotation = 0  # ffmpeg auto rotates the video via metadata
-    else:
-        shutil.copyfile(video_path, new_video_path)
-        video_rotation = get_video_rotation(video_path)
-    video_path = new_video_path
-
-    video_stream = cv2.VideoCapture(video_path)
-
-    # grab frames and fix rotations
-    frames = []
-    while 1:
-        still_reading, frame = video_stream.read()
-        if not still_reading:
-            video_stream.release()
-            break
-        frame = fix_frame_rotation(frame, video_rotation)
-        frames.append(frame)
-
-    # don't extract audio if using empty audio embedding
-    if not empty_audio_embedding and not closest_audio_embedding:
-        audio_path = os.path.join(output_directory, 'audio.wav')
-        if neutral_audio_path:
-            shutil.copyfile(neutral_audio_path, audio_path)
-        else:
-            # extract audio from video
-            subprocess.call(VIDEO_TO_AUDIO_COMMAND.format(
-                input_video_path=video_path,
-                output_audio_path=audio_path
-            ), shell=True)
-
-        if _preprocess_audio:
-            audio_path = preprocess_audio(audio_path=audio_path)
-
-    i = -1
-    if mouth_roi:
-        # get mouth ROI detections
-        mouth_frames = s3fd_detector_and_pytorch_landmarks(frames)
-        for mouth_frame in mouth_frames:
-            i += 1
-            cv2.imwrite(os.path.join(output_directory, '{}.jpg'.format(i)), mouth_frame)
-    else:
-        # get face detections and crop faces to disk
-        batches = [frames[i:i + batch_size] for i in range(0, len(frames), batch_size)]
-        for fb in batches:
-            preds = fa.get_detections_for_batch(np.asarray(fb))
-
-            for j, f in enumerate(preds):
-                i += 1
-                if f is None:
-                    continue
-
-                cv2.imwrite(os.path.join(output_directory, '{}.jpg'.format(i)), f[0])
-    if i == -1:
-        print(f'{video_path} has no face detections')
-        return False  # no face detections
-
-    embeddings_path = os.path.join(output_directory, 'ref.npz')
-    if empty_audio_embedding:
-        embeddings = np.asarray([np.zeros(256, dtype=np.float32)])
-    elif closest_audio_embedding:
-        # get lip movement embedding from lip movement encoder
-        lip_movement_embedding = get_lip_movement_embedding(video_path)
-        if lip_movement_embedding is None:
-            return False
-
-        # perform lookup to find closest audio embedding
-        audio_embeddings_path, distance = lip_to_audio_query(lip_movement_embedding=lip_movement_embedding)
-        print(video_path, audio_embeddings_path)
-        embeddings = np.load(audio_embeddings_path)['ref']
-    else:
-        # get speaker embedding for audio
-        wav = audio_encoder.audio.preprocess_wav(audio_path)  # resamples the audio if required
-        if len(wav) < SECS * audio_encoder.audio.sampling_rate:
-            print(f'{video_path} audio is too short, {len(wav)} < {SECS * audio_encoder.audio.sampling_rate}')
-            return False
-
-        indices = np.random.choice(len(wav) - audio_encoder.audio.sampling_rate * SECS, 1)  # gets 1 random number
-        wavs = [wav[idx: idx + audio_encoder.audio.sampling_rate * SECS] for idx in indices]  # 1 random sampled wav
-        embeddings = np.asarray([eif.embed_utterance(wav) for wav in wavs])  # 1 embedding
-    np.savez_compressed(embeddings_path, ref=embeddings)
-
-    return True
 
 
 def read_window(window_fnames):
@@ -232,119 +48,7 @@ def read_window(window_fnames):
     return images
 
 
-def denoise_audio(audio_path):
-    noisy_pcm_path = audio_path.replace('.wav', '.pcm')
-    denoised_pcm_path = noisy_pcm_path.replace('.pcm', '_denoised.pcm')
-    denoised_wav_path = audio_path.replace('.wav', '_denoised_48khz.wav')
-    denoised_wav_path_final = audio_path.replace('.wav', '_denoised.wav')
-
-    subprocess.call(WAV_TO_PCM_COMMAND.format(
-        input_audio_path=audio_path,
-        output_audio_path=noisy_pcm_path
-    ), shell=True)
-
-    subprocess.call(DENOISE_COMMAND.format(
-        input_audio_path=noisy_pcm_path,
-        output_audio_path=denoised_pcm_path
-    ), shell=True)
-
-    subprocess.call(PCM_TO_WAV_COMMAND.format(
-        input_audio_path=denoised_pcm_path,
-        output_audio_path=denoised_wav_path
-    ), shell=True)
-
-    subprocess.call(WAV_TO_16KHZ_COMMAND.format(
-        input_audio_path=denoised_wav_path,
-        output_audio_path=denoised_wav_path_final
-    ), shell=True)
-
-    for path in [noisy_pcm_path, denoised_pcm_path, denoised_wav_path]:
-        os.remove(path)
-
-    return denoised_wav_path_final
-
-
-def pad_audio(audio_path, delay):
-    padded_audio_path = audio_path.replace('.wav', '_padded.wav')
-
-    subprocess.call(PAD_AUDIO_COMMAND.format(
-        input_audio_path=audio_path,
-        delay=delay,
-        output_audio_path=padded_audio_path
-    ), shell=True)
-
-    return padded_audio_path
-
-
-def remove_audio_pad(audio_path, delay):
-    stripped_audio_path = audio_path.replace('.wav', '_stripped.wav')
-
-    subprocess.call(REMOVE_AUDIO_PAD_COMMAND.format(
-        input_audio_path=audio_path,
-        delay=delay,
-        output_audio_path=stripped_audio_path
-    ), shell=True)
-
-    return stripped_audio_path
-
-
-def normalise_audio(audio_path):
-    normalised_audio_path = audio_path.replace('.wav', '_normalised.wav')
-
-    subprocess.call(NORMALISE_AUDIO_COMMAND.format(
-        input_audio_path=audio_path,
-        output_audio_path=normalised_audio_path
-    ), shell=True)
-
-    return normalised_audio_path
-
-
-def crop_audio(audio_path, start, duration):
-    cropped_audio_path = audio_path.replace('.wav', '_cropped.wav')
-
-    subprocess.call(CROP_AUDIO_COMMAND.format(
-        input_audio_path=audio_path,
-        start_millis=int(start * 1000),
-        duration_millis=int(duration * 1000),
-        output_audio_path=cropped_audio_path
-    ), shell=True)
-
-    return cropped_audio_path
-
-
-def preprocess_audio(audio_path, delay=3):
-    """
-    It was found that denoising and then normalising the audio produced louder/more background noise
-        - the denoising doesn't work as well on softer audio
-        - then the normalising just makes the noise louder
-
-    Normalising and then denoising the audio removed more noise but the sound was only slightly louder
-        - normalising first makes the denoising process better
-        - normalise again for good measure because the denoising process can make the speaking fainter
-
-    Normalising requires audios >= 3 seconds, pad all with silence and remove after
-    See: https://github.com/slhck/ffmpeg-normalize/issues/87
-    """
-    output_audio_path = audio_path.replace('.wav', '_preprocessed.wav')
-
-    # pad, normalise, denoise, normalise and strip
-    padded_audio_path = pad_audio(audio_path, delay=delay)
-    normalised_1_audio_path = normalise_audio(padded_audio_path)
-    denoised_audio_path = denoise_audio(normalised_1_audio_path)
-    normalised_2_audio_path = normalise_audio(denoised_audio_path)
-    stripped_audio_path = remove_audio_pad(normalised_2_audio_path, delay=delay)
-
-    shutil.copyfile(stripped_audio_path, output_audio_path)
-    for p in [padded_audio_path, normalised_1_audio_path,
-              denoised_audio_path, normalised_2_audio_path,
-              stripped_audio_path]:
-        os.remove(p)
-
-    return output_audio_path
-
-
-def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_video=False, denoise_output=False,
-                     clean_up=False):
+def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_video=False, clean_up=False):
     image_paths = glob.glob(os.path.join(video_directory, '*.jpg'))
     till = (len(image_paths) // 5) * 5
     hp = sif.hparams
@@ -380,23 +84,12 @@ def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_vide
     wav = synthesizer.griffin_lim(mel)
     sif.audio.save_wav(wav, generated_output_audio_path, sr=hp.sample_rate)
 
-    if denoise_output:
-        # generate denoise for output audio from network
-        generated_output_audio_path = denoise_audio(audio_path=generated_output_audio_path)
-
     if combine_audio_and_video:
-        original_video_path = video_directory.joinpath('original_video.mp4')
-        tmp_video_path = str(video_directory.joinpath('tmp_video.mp4'))
-        subprocess.call(VIDEO_REMOVE_AUDIO_COMMAND.format(
-            input_video_path=str(original_video_path),
-            output_video_path=tmp_video_path
-        ), shell=True)
-        subprocess.call(VIDEO_ADD_AUDIO_COMMAND.format(
-            input_video_path=tmp_video_path,
-            input_audio_path=generated_output_audio_path,
+        replace_audio(
+            video_path=str(video_directory.joinpath('original_video.mp4')),
+            audio_path=generated_output_audio_path,
             output_video_path=str(video_directory.joinpath('generated_video.mp4'))
-        ), shell=True)
-        os.remove(tmp_video_path)
+        )
 
     if clean_up:
         # remove unnecessary files
@@ -405,17 +98,12 @@ def speech_synthesis(video_directory, video_format='mp4', combine_audio_and_vide
             os.remove(image_path)
 
 
-def get_stois(directory, denoise_output=False):
+def get_stois(directory):
     # get STOI and ESTOI
     hp = sif.hparams
 
-    if denoise_output:
-        pred_wav_name = 'generated_audio_denoised.wav'
-    else:
-        pred_wav_name = 'generated_audio.wav'
-
     gt_wav = sif.audio.load_wav(os.path.join(directory, 'audio.wav'), hp.sample_rate)
-    pred_wav = sif.audio.load_wav(os.path.join(directory, pred_wav_name), hp.sample_rate)
+    pred_wav = sif.audio.load_wav(os.path.join(directory, 'generated_audio.wav'), hp.sample_rate)
 
     if len(gt_wav) > len(pred_wav):
         gt_wav = gt_wav[:pred_wav.shape[0]]
@@ -481,11 +169,29 @@ class DeepSpeechASR(ASR):
         return [prediction['transcript'].lower().strip() for prediction in response.json()]
 
 
+def _round(x):
+    return round(x * 100, 1)
+
+
+def asr_metric(sr, wer):
+    return round(((sr * wer) + ((100 - sr) * 100)) / 100, 1)
+
+
 def get_recognition_accuracies(pred_wav_name, parent_output_directory, groundtruth_path, num_synthesised_samples,
                                gcloud_credentials_path=None, deep_speech=False, phrases_path=None,
                                tally_by_keywords=False, lrw=False, language_code='en-GB', model='command_and_search',
-                               sample_rate=16000,  calculate_hit_rate=False, asr_excluded_paths=None):
-    df = pd.read_csv(groundtruth_path, names=['Video Name', 'Phrase'])
+                               sample_rate=16000,  calculate_hit_rate=False, asr_included_paths=None,
+                               asr_excluded_paths=None):
+    use_alternative_gts = False
+    data = []
+    with open(groundtruth_path, 'r') as f:
+        for line in f.read().splitlines():
+            video_name, phrase, alternatives = re.match(r'([a-zA-Z0-9-]+),([a-z0-9 ]+),?(\[.+\])?', line).groups()
+            if alternatives is not None:
+                alternatives = ast.literal_eval(alternatives)
+                use_alternative_gts = True
+            data.append([video_name, phrase, alternatives])
+    df = pd.DataFrame(data=data, columns=['Video Name', 'Phrase', 'Alternatives'])
     phrases = list(set(df['Phrase'].values))
 
     phrases_df = None
@@ -512,21 +218,26 @@ def get_recognition_accuracies(pred_wav_name, parent_output_directory, groundtru
     rank_accuracies = [0] * 3
     all_predictions, all_groundtruths, best_wers = [], [], []
     hit_rate = 0
+    best_wers_top_1, best_wers_top_3 = [], []
 
     if lrw:
-        pred_wav_name = pred_wav_name.replace('.wav', '_cropped.wav')
+        new_pred_wav_name = pred_wav_name.replace('.wav', '_cropped.wav')
+    else:
+        new_pred_wav_name = pred_wav_name
 
     for index, row in tqdm(list(df.iterrows())):
         output_directory = parent_output_directory.joinpath(row['Video Name'])
         if not output_directory.exists():
             continue
-        if asr_excluded_paths and row['Video Name'] in asr_excluded_paths:
+        if (asr_included_paths and row['Video Name'] not in asr_included_paths) or \
+                (asr_excluded_paths and row['Video Name'] in asr_excluded_paths):
             num_synthesised_samples -= 1
             continue
 
         groundtruth = row['Phrase'].lower()
         audio_path = output_directory.joinpath(pred_wav_name)
-        asr_results_name = f'{client.name}_asr_results_{audio_path.name.replace(".wav", "")}.txt'
+
+        asr_results_name = f'{client.name}_asr_results_{new_pred_wav_name.replace(".wav", "")}.txt'
         asr_results_path = output_directory.joinpath(asr_results_name)
         if asr_results_path.exists():
             with asr_results_path.open('r') as f:
@@ -537,17 +248,28 @@ def get_recognition_accuracies(pred_wav_name, parent_output_directory, groundtru
         else:
             if lrw:
                 # word appears in middle of audio, crop the audio
-                metadata_path = parent_output_directory.parents[0].joinpath(f"{row['Video Name']}.txt")
-                with metadata_path.open('r') as f:
-                    for line in f.read().splitlines():
-                        if not line.lower().startswith('duration'):
-                            continue
-                        duration = line.split(' ')[1].strip()
-                if 'generated' in pred_wav_name:
-                    start = 0.99 / 2  # generated audio is ~0.99 seconds
+                cropped_audio_path = output_directory.joinpath(new_pred_wav_name)
+                if cropped_audio_path.exists():
+                    audio_path = str(cropped_audio_path)
                 else:
-                    start = 1.16 / 2
-                crop_audio(str(audio_path), start, float(duration))
+                    metadata_path = parent_output_directory.parents[0].joinpath(f"{row['Video Name']}.txt")
+                    with metadata_path.open('r') as f:
+                        for line in f.read().splitlines():
+                            if not line.lower().startswith('duration'):
+                                continue
+                            duration = float(line.split(' ')[1].strip())
+
+                    offset = 0.06
+
+                    if 'generated' in new_pred_wav_name:
+                        start = (0.99 / 2) - offset  # generated audio is ~0.99 seconds
+                    else:
+                        start = (1.22 / 2) - offset
+
+                    if duration <= 0.353:
+                        duration = (duration * 1.77) - offset
+
+                    audio_path = crop_audio(str(audio_path), start, duration)
 
             with open(audio_path, 'rb') as f:
                 content = f.read()
@@ -566,7 +288,7 @@ def get_recognition_accuracies(pred_wav_name, parent_output_directory, groundtru
                 with asr_results_path.open('w') as f:
                     for prediction in predictions:
                         f.write(f'{prediction}\n')
-            except UnicodeDecodeError as e:
+            except UnicodeEncodeError as e:
                 print(predictions, e)
                 continue
 
@@ -616,27 +338,50 @@ def get_recognition_accuracies(pred_wav_name, parent_output_directory, groundtru
             if any([groundtruth in prediction for prediction in predictions]):
                 hit_rate += 1
 
+        if use_alternative_gts:
+            # calculate Top 1 and 3 WERs based on alternative groundtruths too (if any)
+            best_wer_top_1, best_wer_top_3 = np.inf, np.inf
+            gts = [groundtruth] + row['Alternatives']
+            for gt in gts:
+                for j, pred in enumerate(predictions):
+                    wer = calculate_wer(gt, pred)
+                    if j == 0 and wer < best_wer_top_1:
+                        best_wer_top_1 = wer
+                    if wer < best_wer_top_3:
+                        best_wer_top_3 = wer
+            best_wers_top_1.append(best_wer_top_1)
+            best_wers_top_3.append(best_wer_top_3)
+
     assert len(all_groundtruths) == len(all_predictions)
 
-    rank_accuracies = [x / num_synthesised_samples for x in rank_accuracies]  # calculated based on no. synthesised samples
-    wer = calculate_wer(all_groundtruths, all_predictions)  # calculated based on synthesised samples with predictions
-    av_best_wer = np.mean(best_wers)
+    rank_accuracies = [_round(x / num_synthesised_samples) for x in rank_accuracies]  # calculated based on no. synthesised samples
+    wer = _round(calculate_wer(all_groundtruths, all_predictions)) if all_predictions else None  # calculated based on synthesised samples with predictions
+    av_best_wer = _round(np.mean(best_wers)) if all_predictions else None
     num_samples_with_predictions = len(all_groundtruths)
     num_samples_without_predictions = num_synthesised_samples - num_samples_with_predictions
-    asr_success_rate = num_samples_with_predictions / num_synthesised_samples
+    asr_success_rate = _round(num_samples_with_predictions / num_synthesised_samples)
+    asr_score_top_1 = asr_metric(asr_success_rate, wer)
+    asr_score_top_3 = asr_metric(asr_success_rate, av_best_wer)
 
     results = [
-        f'\n------------ {pred_wav_name} ASR --------------',
+        f'\n------------ {new_pred_wav_name} {client.name} ASR --------------',
         f'Rank Accuracies: {rank_accuracies}',
-        f'WER: {wer}',
-        f'Av. Best WER: {av_best_wer}',
+        f'WER: {wer} / {av_best_wer}',
         f'No. Samples w/ ASR predictions: {num_samples_with_predictions}',
         f'No. Samples w/o ASR predictions: {num_samples_without_predictions}',
-        f'ASR Success Rate %: {asr_success_rate}'
+        f'ASR Success Rate %: {asr_success_rate}',
+        f'ASR Score %: {asr_score_top_1} / {asr_score_top_3}'
     ]
     if calculate_hit_rate:
-        hit_rate /= num_samples_with_predictions
+        hit_rate = _round(hit_rate / num_samples_with_predictions) if all_predictions else None
         results.append(f'Hit Rate %: {hit_rate}')
+    if use_alternative_gts:
+        av_wer_top_1 = _round(np.mean(best_wers_top_1))
+        av_wer_top_3 = _round(np.mean(best_wers_top_3))
+        asr_score_top_1 = asr_metric(asr_success_rate, av_wer_top_1)
+        asr_score_top_3 = asr_metric(asr_success_rate, av_wer_top_3)
+        results.append(f'WER (w/ alternatives): {av_wer_top_1} / {av_wer_top_3}')
+        results.append(f'ASR Score % (w/ alternatives): {asr_score_top_1} / {asr_score_top_3}')
 
     return results
 
@@ -666,27 +411,53 @@ def main(args):
         video_paths_to_process = np.random.choice(video_paths_to_process, args.num_samples, replace=False)
     total_num_samples = len(video_paths_to_process)
     for video_path in tqdm(video_paths_to_process):
-        output_directory = parent_output_directory.joinpath(video_path.name.replace(f'.{args.video_format}', ''))
-        if not args.redo and os.path.exists(output_directory):
-            output_directories.append(output_directory)
+        video_name = video_path.name.replace(f'.{args.video_format}', '')
+        if args.included_paths and video_name not in args.included_paths:
             continue
+        output_directory = parent_output_directory.joinpath(video_name)
+        if output_directory.exists():
+            if args.redo:
+                shutil.rmtree(str(output_directory))
+            else:
+                output_directories.append(output_directory)
+                continue
+        output_directory.mkdir()
 
-        success = preprocess_video_file(
+        audio_file = None
+        if args.neutral_audio_path:
+            audio_file = tempfile.NamedTemporaryFile(suffix='.wav')
+            with open(args.neutral_audio_path, 'rb') as f:
+                audio_file.write(f.read())
+            audio_file.seek(0)
+
+        if args.closest_audio_embedding:
+            results = lip_query(video_path=str(video_path))
+            if results is None:
+                continue
+            closest_video_path = results[0]
+            print(str(video_path), closest_video_path)
+            audio_file = extract_audio(closest_video_path)
+
+        # TODO: Use multiprocessing here - refactor main in preprocessor.py to
+        #  include function that runs multiprocessing
+        result = preprocess_video(
+            process_index=0,
             video_path=str(video_path),
-            output_directory=output_directory,
-            batch_size=args.batch_size,
-            mouth_roi=args.mouth_roi,
             fps=args.fps,
-            _preprocess_audio=args.preprocess_audio,
-            neutral_audio_path=args.neutral_audio_path,
-            empty_audio_embedding=args.empty_audio_embedding,
-            closest_audio_embedding=args.closest_audio_embedding
+            is_training=False,
+            is_training_data=False,
+            output_directory=output_directory,
+            video_augmentation=False,
+            audio_preprocessing=args.audio_preprocessing,
+            audio_file=audio_file,
+            use_old_ffmpeg=args.use_old_ffmpeg,
+            use_old_mouth_extractor=args.use_old_mouth_extractor,
+            debug=args.debug
         )
-
-        if success:
-            output_directories.append(output_directory)
-        else:
-            shutil.rmtree(output_directory)
+        if result is None:
+            shutil.rmtree(str(output_directory))
+            continue
+        output_directories.append(output_directory)
 
     num_preprocessed_samples = len(output_directories)
     num_failed_preprocessing_samples = total_num_samples - num_preprocessed_samples
@@ -702,7 +473,6 @@ def main(args):
             video_directory=output_directory,
             video_format=args.video_format,
             combine_audio_and_video=args.combine_audio_and_video,
-            denoise_output=args.denoise_output,
             clean_up=args.clean_up
         )
 
@@ -713,13 +483,13 @@ def main(args):
     ]
 
     # don't generate STOI stats if using a different audio embedding from the video
-    if not args.neutral_audio_path and not args.empty_audio_embedding and not args.closest_audio_embedding:
+    if not args.neutral_audio_path and not args.closest_audio_embedding:
         # generate STOI stats for all the videos
         print('Generating STOI stats...')
         av_stoi, av_estoi = 0, 0
         for output_directory in tqdm(output_directories):
             # calculated on samples that exist
-            stoi, estoi = get_stois(output_directory, denoise_output=args.denoise_output)
+            stoi, estoi = get_stois(output_directory)
             av_stoi += stoi
             av_estoi += estoi
         av_stoi /= len(output_directories)
@@ -733,7 +503,7 @@ def main(args):
         print('Not generating STOI stats because using a different embedding i.e. invalid to compare pred to gt audio')
 
     # only generate ASR stats if we've groundtruth and google ASR credentials
-    groundtruth_path = videos_directory.joinpath('groundtruth.csv')
+    groundtruth_path = videos_directory.joinpath(args.groundtruth_name)
     run_asr = args.gcloud_credentials_path or args.deep_speech
     if groundtruth_path.exists() and run_asr:
 
@@ -743,10 +513,7 @@ def main(args):
             if args.preprocess_audio:
                 pred_wav_names += ['audio_preprocessed.wav']
 
-        if args.denoise_output:
-            pred_wav_names += ['generated_audio_denoised.wav']
-        else:
-            pred_wav_names += ['generated_audio.wav']
+        pred_wav_names += ['generated_audio.wav']
 
         for pred_wav_name in pred_wav_names:
             print(f'Generating ASR stats for {pred_wav_name}...')
@@ -764,6 +531,7 @@ def main(args):
                 model=args.asr_model,
                 sample_rate=args.asr_sample_rate,
                 calculate_hit_rate=args.calculate_hit_rate,
+                asr_included_paths=args.asr_included_paths,
                 asr_excluded_paths=args.asr_excluded_paths
             )
             stats.extend(asr_results)
@@ -782,15 +550,18 @@ def main(args):
 
 
 if __name__ == '__main__':
-    def file_path_contents(p):
-        with open(p, 'r') as f:
-            return f.read().splitlines()
+    def file_path_contents(s):
+        all_contents = []
+        for path in s.split(','):
+            with open(path, 'r') as f:
+                all_contents.extend(f.read().splitlines())
+
+        return all_contents
 
     parser = argparse.ArgumentParser()
     parser.add_argument('videos_directory')
     parser.add_argument('output_directory')
     parser.add_argument('model_checkpoint')
-    parser.add_argument('--mouth_roi', action='store_true')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--fps', type=int, default=25)
     parser.add_argument('--redo', action='store_true')
@@ -798,15 +569,13 @@ if __name__ == '__main__':
     parser.add_argument('--combine_audio_and_video', action='store_true')
     parser.add_argument('--neutral_audio_path')  # for extracting a neutral audio embedding
     parser.add_argument('--clean_up', action='store_true')
-    parser.add_argument('--empty_audio_embedding', action='store_true')
-    parser.add_argument('--preprocess_audio', action='store_true')
-    parser.add_argument('--denoise_output', action='store_true')
+    parser.add_argument('--audio_preprocessing', action='store_true')
     parser.add_argument('--closest_audio_embedding', action='store_true')
     parser.add_argument('--stats_only', action='store_true')
     parser.add_argument('--gcloud_credentials_path')
     parser.add_argument('--deep_speech', action='store_true')
     parser.add_argument('--asr_test_groundtruth', action='store_true')
-    parser.add_argument('--phrases_path', help='')
+    parser.add_argument('--phrases_path', help='Contains phrases to key word mapping to tally by keywords')
     parser.add_argument('--image_height', type=int, default=128, help='Used for mouth ROI')
     parser.add_argument('--image_width', type=int, default=128, help='Used for mouth ROI')
     parser.add_argument('--num_samples', type=int, help='Randomly select this number of samples to generate')
@@ -816,9 +585,12 @@ if __name__ == '__main__':
     parser.add_argument('--asr_model', default='command_and_search')
     parser.add_argument('--asr_sample_rate', type=int, default=16000)
     parser.add_argument('--calculate_hit_rate', action='store_true')
+    parser.add_argument('--included_paths', type=file_path_contents)
+    parser.add_argument('--asr_included_paths', type=file_path_contents)
     parser.add_argument('--asr_excluded_paths', type=file_path_contents)
-
-    # TODO: If 15 fps applied to video, generated_video stays at same pace as original_video
-    #  audio is reduced
+    parser.add_argument('--groundtruth_name', default='groundtruth.csv')
+    parser.add_argument('--use_old_ffmpeg', action='store_true')
+    parser.add_argument('--use_old_mouth_extractor', action='store_true')
+    parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())

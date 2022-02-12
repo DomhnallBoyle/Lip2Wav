@@ -14,10 +14,11 @@ import cv2
 import numpy as np
 import redis
 
-from detectors import get_mouth_frames
+from detectors import get_mouth_frames_wrapper as get_mouth_frames
 from audio_utils import extract_mel_spectrogram, get_audio_embeddings, play_audio, preprocess_audio
-from video_utils import convert_fps, extract_audio, run_frame_augmentation, get_fps, get_video_frames, \
-    get_video_rotation, show_frames, run_video_augmentation
+from video_utils import convert_fps, extract_audio, get_fps, get_video_frames, get_video_rotation, \
+    run_video_augmentation, show_frames
+
 
 UP = "\x1B[4A"
 CLR = "\x1B[0K"
@@ -34,15 +35,15 @@ def get_selection_weights(redis_server, pull_list_name):
         speaker_ids.append(speaker_id)
     speaker_weight = 1. / len(speaker_counts)
     selection_weights = [speaker_weight / speaker_counts[speaker_id]
-                         for speaker_id in speaker_ids]
+                         for speaker_id in speaker_ids]  # the higher the weight, the more likely it will be picked
     assert len(selection_weights) == len(speaker_ids)
 
     return selection_weights
 
 
 def process_video(process_index, video_path, fps=None, is_training=False, is_training_data=False, output_directory=None,
-                  augmentation_prob=0.5, video_augmentation=False, frame_augmentation=False, audio_preprocessing=False,
-                  audio_file=None, use_old_ffmpeg=False, debug=False):
+                  augmentation_prob=0.5, video_augmentation=False, audio_preprocessing=False, audio_file=None,
+                  use_old_ffmpeg=False, use_old_mouth_extractor=False, debug=False):
     debug = debug and process_index == 0
 
     # only apply augmentation if training data and randomly at 50%
@@ -63,28 +64,19 @@ def process_video(process_index, video_path, fps=None, is_training=False, is_tra
         video_rotation = get_video_rotation(video_path=video_path)
 
     video_frames = get_video_frames(video_path=video_path, rotation=video_rotation)
+    if not video_frames:
+        return
 
     if debug:
         show_frames(video_frames, delay=fps, title=f'{process_index} - Original')
 
-    # apply full frame augmentation if applicable
-    if apply_video_augmentation and frame_augmentation:
-        video_frames = run_frame_augmentation(frames=video_frames, method='full')
-
-    if debug:
-        show_frames(video_frames, delay=fps, title=f'{process_index} - Augmentation')
-
     # find and crop mouth ROI
     mouth_frames = []
-    for method in ['dlib']:
-        try:
-            mouth_frames = get_mouth_frames(frames=video_frames, method=method)
-        except Exception as e:
-            print(e)
-            break
-        if mouth_frames:
-            break
-    if not mouth_frames:  # if failed dlib and s3fd detectors
+    try:
+        mouth_frames = get_mouth_frames(frames=video_frames, use_old_method=use_old_mouth_extractor)
+    except Exception as e:
+        print(e)
+    if not mouth_frames:
         return
     video_frames = mouth_frames
 
@@ -146,10 +138,12 @@ def main(args):
     if not redis_server.exists(args.pull_list_name):
         raise Exception(f'Redis Key "{args.pull_list_name}" does not exist')
 
-    # grab selection weights for pulling video paths from the list
-    selection_weights = get_selection_weights(redis_server, args.pull_list_name)
+    selection_weights = None
     all_indexes = list(range(redis_server.llen(args.pull_list_name)))
-    assert len(all_indexes) == len(selection_weights)
+    if args.weighted_user_selection: 
+        # grab selection weights for pulling video paths from the list
+        selection_weights = get_selection_weights(redis_server, args.pull_list_name)
+        assert len(all_indexes) == len(selection_weights)
 
     num_processes = args.num_processes
 
@@ -178,8 +172,8 @@ def main(args):
             tasks = []
             for i, video_path in enumerate(video_paths):
                 tasks.append([i, video_path, args.fps, args.is_training, args.is_training_data, None,
-                              args.augmentation_prob, args.video_augmentation, args.frame_augmentation,
-                              args.audio_preprocessing, args.use_old_ffmpeg, args.debug])
+                              args.augmentation_prob, args.video_augmentation, args.audio_preprocessing,
+                              None, args.use_old_ffmpeg, args.use_old_mouth_extractor, args.debug])
 
             # run the process pool, collect the results and push to the queue
             with multiprocessing.Pool(processes=num_processes) as pool:
@@ -212,7 +206,6 @@ if __name__ == '__main__':
     parser.add_argument('--augmentation_prob', type=float, default=0.5)
     parser.add_argument('--audio_preprocessing', action='store_true')
     parser.add_argument('--video_augmentation', action='store_true')
-    parser.add_argument('--frame_augmentation', action='store_true')
     parser.add_argument('--redis_host', default='redis')
     parser.add_argument('--redis_port', type=int, default=6379)
     parser.add_argument('--pull_list_name', default='feed_list')
@@ -223,5 +216,7 @@ if __name__ == '__main__':
     parser.add_argument('--fps', type=int)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--clear_push_list', action='store_true')
+    parser.add_argument('--weighted_user_selection', action='store_true')
+    parser.add_argument('--use_old_mouth_extractor', action='store_true')
 
     main(parser.parse_args())

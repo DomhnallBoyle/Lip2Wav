@@ -3,22 +3,26 @@ import random
 import re
 import subprocess
 import tempfile
+from datetime import timedelta
 
 import cv2
 import numpy as np
 import requests
 from vidaug import augmentors as va
 
-# this is a static build from https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-i686-static.tar.xz
+# this is a static build from https://www.johnvansickle.com/ffmpeg/old-releases/ffmpeg-4.4.1-i686-static.tar.xz
 # requires new ffmpeg version for:
 # - duration of extracted audio == video
 # - contains x264 codec in build required for clean video frames
 FFMPEG_PATH = '/opt/lip2wav/ffmpeg-4.4.1-i686-static/ffmpeg'
+FFPROBE_PATH = '/opt/lip2wav/ffmpeg-4.4.1-i686-static/ffprobe'
 OLD_FFMPEG_PATH = 'ffmpeg-2.8.15'
 
 FFMPEG_OPTIONS = '-hide_banner -loglevel panic'
 
+VIDEO_CROP_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -ss {{start_time}} -to {{end_time}} -async 1 {{output_video_path}}'
 VIDEO_INFO_COMMAND = f'{FFMPEG_PATH} -i {{input_video_path}}'
+VIDEO_DURATION_COMMAND = f'{FFPROBE_PATH} {FFMPEG_OPTIONS} -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {{video_path}}'
 VIDEO_TO_AUDIO_COMMAND = f'{{ffmpeg_path}} {FFMPEG_OPTIONS} -threads 1 -y -i {{input_video_path}} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {{output_audio_path}}'
 VIDEO_CONVERT_FPS_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -strict -2 -filter:v fps=fps={{fps}} {{output_video_path}}'  # copies original codecs and metadata (rotation)
 VIDEO_SPEED_ALTER_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -filter_complex "[0:v]setpts={{video_speed}}*PTS[v];[0:a]atempo={{audio_speed}}[a]" -map "[v]" -map "[a]" {{output_video_path}}'
@@ -50,6 +54,13 @@ def get_video_frame(video_path, index):
     video_capture.release()
 
     return selected_frame
+
+
+def get_video_duration(video_path):
+    result = subprocess.check_output(VIDEO_DURATION_COMMAND.format(video_path=video_path).split(' '),
+                                     stderr=subprocess.STDOUT).decode()
+
+    return float(result)
 
 
 def get_video_rotation(video_path):
@@ -219,3 +230,17 @@ def get_lip_embeddings(video_path):
             return
 
         return json.loads(response.content)
+
+
+def crop(video_path, start, end):
+    suffix = video_path.split('/')[-1].split('.')[1]
+    output_video_path = f'/tmp/cropped_video.{suffix}'
+
+    subprocess.call(VIDEO_CROP_COMMAND.format(
+        input_video_path=video_path,
+        start_time='0' + str(timedelta(seconds=start))[:-3],
+        end_time='0' + str(timedelta(seconds=end))[:-3],
+        output_video_path=output_video_path
+    ), shell=True)
+
+    return output_video_path

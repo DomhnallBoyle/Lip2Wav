@@ -152,7 +152,8 @@ def train(log_dir, args, hparams):
             apply_augmentation=args.apply_augmentation,
             lrw=args.dataset == 'LRW',
             training_sample_pool_location=args.training_sample_pool_location,
-            val_sample_pool_location=args.val_sample_pool_location
+            val_sample_pool_location=args.val_sample_pool_location,
+            use_selection_weights=args.use_selection_weights
         )
     
     # Set up model:
