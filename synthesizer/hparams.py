@@ -362,14 +362,16 @@ hparams = HParams(
     # face ROI
     img_height=128,
     img_width=128,
-
-    # # mouth ROI
-    # img_height=50,
-    # img_width=100,
+    num_channels=3,
 
     fps=25,
 
-    augmentation_prob=0.5
+    augmentation_prob=0.5,
+
+    speaker_disentanglement=False,
+    num_speakers=None,
+
+    use_deltas_features=False
 )
 
 

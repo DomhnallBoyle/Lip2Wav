@@ -1,4 +1,5 @@
 import argparse
+import math
 import random
 import pickle
 import time
@@ -19,7 +20,7 @@ MEL_STEP_SIZE = hp.hparams.mel_step_size
 MEL_HOP_SIZE = hp.hparams.hop_size
 
 
-def get_window(frames, lrw=False):
+def get_window(frames, center_id=None, lrw=False):
     # function selects a window of 25 frames
     # makes sure that selected window is within the bounds of the video
     # has functionality to select windows at the start and the end of the video
@@ -28,7 +29,8 @@ def get_window(frames, lrw=False):
     if num_video_frames < NUM_TIMESTEPS:
         return
 
-    center_id = random.randint(0, num_video_frames - 1)  # inclusive
+    if not center_id:
+        center_id = random.randint(0, num_video_frames - 1)  # inclusive
 
     if lrw:
         if NUM_TIMESTEPS % 2:
@@ -88,16 +90,22 @@ def main(args):
         # this is selecting from the head of the list which contains objects preprocessed at random
         preprocessed_obj = redis_server.lpop(args.pull_list_name)
         if not preprocessed_obj:
-            time.sleep(0.1)
+            time.sleep(1)
             continue
 
         video_path, video_frames, mel_spec, speaker_embeddings = pickle.loads(preprocessed_obj)
-        _class = video_path.split('/')[-2] if args.group_by_class else None
+        _class = None
+        if args.group_by_user:
+            _class = video_path.split('/')[-2]
+        elif args.group_by_word:
+            _class = video_path.split('/')[-1].split('_')[1]
 
-        # use all embeddings associated with a video to create multiple samples
-        for speaker_embedding in speaker_embeddings:
-            speaker_embedding = speaker_embedding.astype(np.float32)
+        # only apply time masking to training data
+        mean_frame = np.mean(video_frames, axis=0) if args.use_time_masking and args.is_training_data else None
 
+        speaker_embedding = speaker_embeddings[0].astype(np.float32)
+
+        for _ in range(5):
             # grab video window
             window = get_window(video_frames, lrw=args.lrw)
             if not window:
@@ -108,6 +116,14 @@ def main(args):
             mel_spec_window = crop_audio_window(mel_spec.T, start_frame_id).astype(np.float32)
             if mel_spec_window.shape[0] != MEL_STEP_SIZE:
                 continue
+
+            # time masking augmentation - https://arxiv.org/pdf/2202.13084v1.pdf
+            if mean_frame is not None:
+                mask_duration_secs = np.random.uniform(0, 0.4)
+                mask_duration_frames = math.ceil(NUM_TIMESTEPS * mask_duration_secs)  # choose num frames to mask
+                frame_index = random.randint(0, NUM_TIMESTEPS - mask_duration_frames)  # choose start index of mask
+                for i in range(frame_index, frame_index + mask_duration_frames):
+                    video_frames_window[i] = mean_frame
 
             # only apply augmentation if training data and randomly at 50%
             apply_video_augmentation = args.is_training_data and random.random() < args.augmentation_prob
@@ -133,11 +149,13 @@ if __name__ == '__main__':
     parser.add_argument('--is_training_data', action='store_true')
     parser.add_argument('--augmentation_prob', type=float, default=0.5)
     parser.add_argument('--frame_augmentation', action='store_true')
+    parser.add_argument('--use_time_masking', action='store_true')
     parser.add_argument('--redis_host', default='redis')
     parser.add_argument('--redis_port', type=int, default=6379)
     parser.add_argument('--pull_list_name', default='preprocessed_list')
     parser.add_argument('--lrw', action='store_true')
-    parser.add_argument('--group_by_class', action='store_true')
+    parser.add_argument('--group_by_user', action='store_true')
+    parser.add_argument('--group_by_word', action='store_true')
     parser.add_argument('--debug', action='store_true')
 
     main(parser.parse_args())

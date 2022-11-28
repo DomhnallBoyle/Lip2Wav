@@ -26,9 +26,12 @@ class SamplePool:
 
         if num_samples + 1 > max_size:
             # remove sample at random
-            random_index = random.randint(0, num_samples - 1)  # inclusive
-            sample_to_remove = sample_paths[random_index]
-            os.remove(str(sample_to_remove))
+            while True:
+                random_index = random.randint(0, num_samples - 1)  # inclusive
+                sample_to_remove = str(sample_paths[random_index])
+                if os.path.exists(sample_to_remove):
+                    os.remove(sample_to_remove)
+                    break
         
         save_name = f'{str(uuid.uuid4())}.npz'
         if _class: 
@@ -56,6 +59,19 @@ class SamplePool:
                 assert len(selection_weights) == len(classes) == len(sample_path_list)
 
                 random_sample_paths = random.choices(sample_path_list, k=count, weights=selection_weights)
+
+                # counting the number of each selected class
+                selected_class_counts_path = self.location.joinpath('selected_class_counts.pkl')
+                if selected_class_counts_path.exists():
+                    with selected_class_counts_path.open('rb') as f:
+                        selected_class_counts = pickle.load(f)
+                else:
+                    selected_class_counts = {}
+                for sample_path in random_sample_paths:
+                    _class = sample_path.name.split('_')[0]
+                    selected_class_counts[_class] = selected_class_counts.get(_class, 0) + 1
+                with selected_class_counts_path.open('wb') as f:
+                    pickle.dump(selected_class_counts, f)
             else:
                 random_sample_paths = random.sample(sample_path_list, count)
 
@@ -69,7 +85,8 @@ class SamplePool:
                 print(e)
 
     def sample_paths(self):
-        return list(self.location.glob('*.npz'))
+        return [f'{d}/{f}' for d, _, fs in os.walk(self.location) for f in fs if f[-4:] == '.npz']
+        # return list(self.location.glob('*.npz'))
 
     def size(self):
         return len(self.sample_paths())

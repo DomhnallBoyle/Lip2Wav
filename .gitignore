@@ -14,3 +14,11 @@ synthesizer/saved_models/*
 *.npz
 *.ckpt*
 *.idea
+*.png
+.vscode
+evaluation
+ffmpeg*
+*.txt
+experiments
+gcp.json
+*saved_models

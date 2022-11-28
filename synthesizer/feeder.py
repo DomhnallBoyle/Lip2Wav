@@ -19,6 +19,7 @@ _batches_per_group = 4
 test_feeding_status, load_next_test_sample = False, False
 num_queued_batches = 0
 selected_window_counts = {}
+speaker_ids = {}
 
 
 class Feeder:
@@ -26,7 +27,7 @@ class Feeder:
     Feeds batches of data into queue on a background thread.
     """
 
-    def __init__(self, coordinator, hparams, num_test_batches, apply_augmentation=False, lrw=False,
+    def __init__(self, coordinator, hparams, num_test_batches, apply_augmentation=False,
                  training_sample_pool_location='/tmp/training_sample_pool',
                  val_sample_pool_location='/tmp/val_sample_pool', 
                  use_selection_weights=False):
@@ -45,7 +46,6 @@ class Feeder:
         self.use_selection_weights = use_selection_weights
 
         self.apply_augmentation = apply_augmentation
-        self.lrw = lrw
 
         # pad input sequences with the <pad_token> 0 ( _ )
         self._pad = 0
@@ -62,32 +62,27 @@ class Feeder:
             # Create placeholders for inputs and targets. Don"t specify batch size because we want
             # to be able to feed different batch sizes at eval time.
             self._placeholders = [
-                tf.placeholder(tf.float32, shape=(
-                    None, hparams.T, hparams.img_height, hparams.img_width, 3), name="inputs"),
+                tf.placeholder(tf.float32, shape=(None, hparams.T, hparams.img_height,
+                                                  hparams.img_width, hparams.num_channels), name='inputs'),
                 tf.placeholder(tf.int32, shape=(None,), name="input_lengths"),
-                tf.placeholder(tf.float32, shape=(None, hparams.mel_step_size, hparams.num_mels),
-                               name="mel_targets"),
+                tf.placeholder(tf.float32, shape=(None, hparams.mel_step_size, hparams.num_mels), name="mel_targets"),
                 #tf.placeholder(tf.float32, shape=(None, None), name="token_targets"),
-                tf.placeholder(tf.int32, shape=(None, ),
-                               name="targets_lengths"),
-                tf.placeholder(tf.int32, shape=(hparams.tacotron_num_gpus, None),
-                               name="split_infos"),
-
-                # SV2TTS
-                tf.placeholder(tf.float32, shape=(None, 256),
-                               name="speaker_embeddings")
+                tf.placeholder(tf.int32, shape=(None,), name="targets_lengths"),
+                tf.placeholder(tf.int32, shape=(hparams.tacotron_num_gpus, None), name="split_infos"),
+                tf.placeholder(tf.float32, shape=(None, 256), name="speaker_embeddings"),
+                tf.placeholder(tf.int32, shape=(None,), name='speaker_targets')
             ]
 
             # Create queue for buffering data
             # queue = tf.FIFOQueue(8, [tf.float32, tf.int32, tf.float32, tf.float32,
             #						 tf.int32, tf.int32, tf.float32], name="input_queue")
-            queue = tf.FIFOQueue(8, [tf.float32, tf.int32, tf.float32,
-                                     tf.int32, tf.int32, tf.float32], name="input_queue")
+            queue = tf.FIFOQueue(8, [tf.float32, tf.int32, tf.float32, tf.int32, tf.int32, tf.float32, tf.int32],
+                                 name="input_queue")
             self._enqueue_op = queue.enqueue(self._placeholders)
             #self.inputs, self.input_lengths, self.mel_targets, self.token_targets, \
             #	self.targets_lengths, self.split_infos, self.speaker_embeddings = queue.dequeue()
-            self.inputs, self.input_lengths, self.mel_targets, \
-                self.targets_lengths, self.split_infos, self.speaker_embeddings = queue.dequeue()
+            self.inputs, self.input_lengths, self.mel_targets, self.targets_lengths, self.split_infos, \
+                self.speaker_embeddings, self.speaker_targets = queue.dequeue()
 
             self.inputs.set_shape(self._placeholders[0].shape)
             self.input_lengths.set_shape(self._placeholders[1].shape)
@@ -96,6 +91,7 @@ class Feeder:
             self.targets_lengths.set_shape(self._placeholders[3].shape)
             self.split_infos.set_shape(self._placeholders[4].shape)
             self.speaker_embeddings.set_shape(self._placeholders[5].shape)
+            self.speaker_targets.set_shape(self._placeholders[6].shape)
 
             # Create eval queue for buffering eval data
             # eval_queue = tf.FIFOQueue(1, [tf.float32, tf.int32, tf.float32, tf.float32,
@@ -187,33 +183,6 @@ class Feeder:
         return np.asarray(batches)
 
     def _enqueue_next_train_group(self):
-        # global num_queued_batches
-        # num_queued_batches = 0
-        # num_batches = _batches_per_group
-        # batch_size = self._hparams.tacotron_batch_size
-        # r = self._hparams.outputs_per_step
-        #
-        # selection_weights = self.get_selection_weights(split='train')
-        #
-        # while not self._coord.should_stop():
-        #     while num_queued_batches != num_batches:
-        #         start = time.time()
-        #
-        #         image_paths = self.get_image_paths(split='train', num_samples=batch_size,
-        #                                            selection_weights=selection_weights)
-        #
-        #         batch = [self.get_item(img_name=image_path, split='train')
-        #                  for image_path in image_paths]
-        #         # bucket samples based on similar output sequence length for efficiency
-        #         batch.sort(key=lambda x: x[-1])
-        #
-        #         log(f'Generated 1 train batch of size {len(batch)} in {time.time() - start:.3f} sec')
-        #         feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
-        #         self._session.run(self._enqueue_op, feed_dict=feed_dict)
-        #         num_queued_batches += 1
-        #         log(f'Num queued batches: {num_queued_batches}')
-        #     time.sleep(0.1)
-
         global num_queued_batches
         num_queued_batches = 0
         num_batches = _batches_per_group
@@ -224,14 +193,14 @@ class Feeder:
         while not self._coord.should_stop():
             while num_queued_batches != num_batches:
                 start = time.time()
-                batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=self.use_selection_weights)]
+                batch = sample_pool.read(count=batch_size, use_selection_weights=self.use_selection_weights)
                 if not batch:
                     time.sleep(0.1)
                     continue
                 # bucket samples based on similar output sequence length for efficiency
                 batch.sort(key=lambda x: x[-1])
 
-                feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
+                feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r, is_training=True)))
                 self._session.run(self._enqueue_op, feed_dict=feed_dict)
                 num_queued_batches += 1
 
@@ -240,30 +209,6 @@ class Feeder:
             time.sleep(0.1)
 
     def _enqueue_next_test_group(self):
-        # global test_feeding_status, load_next_test_sample
-        # test_batch_pool, r = self.make_test_batches(
-        #     batch_size=self._hparams.tacotron_batch_size,
-        #     num_batches=1000
-        # )  # loads image paths to save memory
-        # r = self._hparams.outputs_per_step
-        # while not self._coord.should_stop():
-        #     if test_feeding_status:  # begin testing time
-        #         i = 0
-        #         test_batches = np.random.choice(test_batch_pool, self.num_test_batches)  # pick random batch from pool
-        #         while i < self.num_test_batches:
-        #             if load_next_test_sample:
-        #                 batch = test_batches[i]
-        #                 batch = [self.get_item(img_name=img_name, split='test') for img_name in batch]
-        #                 np.random.shuffle(batch)  # shuffle the batch to get different saved output
-        #                 feed_dict = dict(zip(self._placeholders, self._prepare_batch(batch, r)))
-        #                 self._session.run(self._eval_enqueue_op, feed_dict=feed_dict)
-        #                 i += 1
-        #                 load_next_test_sample = False
-        #             time.sleep(0.1)
-        #         log(f'Queued Test batches: {i}')
-        #         test_feeding_status = False
-        #     time.sleep(0.1)
-
         global test_feeding_status, load_next_test_sample
         batch_size = self._hparams.tacotron_batch_size
         r = self._hparams.outputs_per_step
@@ -274,7 +219,7 @@ class Feeder:
                 i = 0
                 while i < self.num_test_batches:
                     if load_next_test_sample:
-                        batch = [s[1:] for s in sample_pool.read(count=batch_size, use_selection_weights=self.use_selection_weights)]
+                        batch = sample_pool.read(count=batch_size, use_selection_weights=self.use_selection_weights)
                         if not batch:
                             time.sleep(0.1)
                             continue
@@ -286,7 +231,7 @@ class Feeder:
                     time.sleep(0.1)
                 log(f'Queued Test batches: {i}')
                 test_feeding_status = False
-            time.sleep(0.1)
+            time.sleep(1)
 
     def dequeue_training_sample(self):
         global num_queued_batches
@@ -360,7 +305,7 @@ class Feeder:
 
         return x.astype(np.float32), mel.astype(np.float32), ref.astype(np.float32), len(mel)
 
-    def _prepare_batch(self, batches, outputs_per_step):
+    def _prepare_batch(self, batches, outputs_per_step, is_training=False):
         assert 0 == len(batches) % self._hparams.tacotron_num_gpus
         size_per_device = int(len(batches) / self._hparams.tacotron_num_gpus)
         np.random.shuffle(batches)
@@ -370,22 +315,18 @@ class Feeder:
         #token_targets = None
         targets_lengths = None
         split_infos = []
+        speaker_targets = []
 
-        targets_lengths = np.asarray(
-            [x[-1] for x in batches], dtype=np.int32)  # Used to mask loss
-        input_lengths = np.asarray([len(x[0])
-                                   for x in batches], dtype=np.int32)
+        targets_lengths = np.asarray([x[-1] for x in batches], dtype=np.int32)  # Used to mask loss
+        input_lengths = np.asarray([len(x[1]) for x in batches], dtype=np.int32)
 
         for i in range(self._hparams.tacotron_num_gpus):
             batch = batches[size_per_device*i:size_per_device*(i+1)]
-            input_cur_device, input_max_len = self._prepare_inputs(
-                [x[0] for x in batch])
-            inputs = np.concatenate(
-                (inputs, input_cur_device), axis=1) if inputs is not None else input_cur_device
-            mel_target_cur_device, mel_target_max_len = self._prepare_targets(
-                [x[1] for x in batch], outputs_per_step)
-            mel_targets = np.concatenate(
-                (mel_targets, mel_target_cur_device), axis=1) if mel_targets is not None else mel_target_cur_device
+            input_cur_device, input_max_len = self._prepare_inputs([x[1] for x in batch])
+            inputs = np.concatenate((inputs, input_cur_device), axis=1) if inputs is not None else input_cur_device
+            mel_target_cur_device, mel_target_max_len = self._prepare_targets([x[2] for x in batch], outputs_per_step)
+            mel_targets = np.concatenate((mel_targets, mel_target_cur_device), axis=1) \
+                if mel_targets is not None else mel_target_cur_device
 
             # Pad sequences with 1 to infer that the sequence is done
             #token_target_cur_device, token_target_max_len = self._prepare_token_targets([x[2] for x in batch], outputs_per_step)
@@ -394,17 +335,30 @@ class Feeder:
 
         split_infos = np.asarray(split_infos, dtype=np.int32)
 
-        ### SV2TTS ###
+        embed_targets = np.asarray([x[3] for x in batches])
 
-        #embed_targets = np.asarray([x[3] for x in batches])
-        embed_targets = np.asarray([x[2] for x in batches])
+        # grab the speaker targets
+        if is_training and self._hparams.speaker_disentanglement:
+            for video_path in [x[0] for x in batches]:
+                speaker_id = video_path.split('/')[-2]
+                if speaker_id in speaker_ids:
+                    int_id = speaker_ids[speaker_id]
+                else:
+                    try:
+                        int_id = max(speaker_ids.values()) + 1  # next int ID
+                    except ValueError:
+                        int_id = 0
+                    speaker_ids[speaker_id] = int_id
+                speaker_targets.append(int_id)
+        speaker_targets = np.asarray(speaker_targets)
 
-        ##############
+        # if using greyscale images, add a new axis to the inputs
+        if self._hparams.num_channels == 1:
+            inputs = inputs[..., np.newaxis]
 
         # return inputs, input_lengths, mel_targets, token_targets, targets_lengths, \
         #	   split_infos, embed_targets
-        return inputs, input_lengths, mel_targets, targets_lengths, \
-            split_infos, embed_targets
+        return inputs, input_lengths, mel_targets, targets_lengths, split_infos, embed_targets, speaker_targets
 
     def _prepare_inputs(self, inputs):
         max_len = max([len(x) for x in inputs])
@@ -437,59 +391,59 @@ class Feeder:
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
 
-    def get_window(self, center_frame):
-        # function selects a window of 25 frames
-        # makes sure that selected window is within the bounds of the video
-        # has functionality to select windows at the start and the end of the video
-        # which is important for non-speech silence generation i.e. not lrw
-
-        center_id = self.get_frame_id(center_frame)
-        vidname = dirname(center_frame)
-
-        if self.lrw:
-            if self._hparams.T % 2:
-                window_ids = range(center_id - self._hparams.T//2, center_id + self._hparams.T//2 + 1)
-            else:
-                window_ids = range(center_id - self._hparams.T//2, center_id + self._hparams.T//2)
-
-            window_fnames = []
-            for frame_id in window_ids:
-                frame = join(vidname, '{}.jpg'.format(frame_id))
-                if not isfile(frame):
-                    return None, None
-                window_fnames.append(frame)
-
-            start = center_id - self._hparams.T//2
-
-            return window_fnames, start
-        else:
-            half_num_timesteps = self._hparams.T // 2
-            num_video_frames = len(glob.glob(join(vidname, '*.jpg')))
-
-            if center_id < half_num_timesteps:
-                start = 0
-                end = self._hparams.T
-            elif center_id > (num_video_frames - half_num_timesteps):
-                start = (num_video_frames - self._hparams.T) + 1
-                end = num_video_frames + 1
-            else:
-                start = center_id - half_num_timesteps
-                end = center_id + half_num_timesteps + 1
-
-            attempts = 2
-            while attempts != 0:
-                window_ids = range(start, end)
-                assert len(window_ids) == 25
-                window_fnames = [join(vidname, f'{frame_id}.jpg') for frame_id in window_ids]
-                if not all([isfile(fname) for fname in window_fnames]):
-                    start -= 1
-                    end -= 1
-                    attempts -= 1
-                    continue
-
-                return window_fnames, start
-
-            return None, None
+    # def get_window(self, center_frame):
+    #     # function selects a window of 25 frames
+    #     # makes sure that selected window is within the bounds of the video
+    #     # has functionality to select windows at the start and the end of the video
+    #     # which is important for non-speech silence generation i.e. not lrw
+    #
+    #     center_id = self.get_frame_id(center_frame)
+    #     vidname = dirname(center_frame)
+    #
+    #     if self.lrw:
+    #         if self._hparams.T % 2:
+    #             window_ids = range(center_id - self._hparams.T//2, center_id + self._hparams.T//2 + 1)
+    #         else:
+    #             window_ids = range(center_id - self._hparams.T//2, center_id + self._hparams.T//2)
+    #
+    #         window_fnames = []
+    #         for frame_id in window_ids:
+    #             frame = join(vidname, '{}.jpg'.format(frame_id))
+    #             if not isfile(frame):
+    #                 return None, None
+    #             window_fnames.append(frame)
+    #
+    #         start = center_id - self._hparams.T//2
+    #
+    #         return window_fnames, start
+    #     else:
+    #         half_num_timesteps = self._hparams.T // 2
+    #         num_video_frames = len(glob.glob(join(vidname, '*.jpg')))
+    #
+    #         if center_id < half_num_timesteps:
+    #             start = 0
+    #             end = self._hparams.T
+    #         elif center_id > (num_video_frames - half_num_timesteps):
+    #             start = (num_video_frames - self._hparams.T) + 1
+    #             end = num_video_frames + 1
+    #         else:
+    #             start = center_id - half_num_timesteps
+    #             end = center_id + half_num_timesteps + 1
+    #
+    #         attempts = 2
+    #         while attempts != 0:
+    #             window_ids = range(start, end)
+    #             assert len(window_ids) == 25
+    #             window_fnames = [join(vidname, f'{frame_id}.jpg') for frame_id in window_ids]
+    #             if not all([isfile(fname) for fname in window_fnames]):
+    #                 start -= 1
+    #                 end -= 1
+    #                 attempts -= 1
+    #                 continue
+    #
+    #             return window_fnames, start
+    #
+    #         return None, None
 
     def crop_audio_window(self, spec, start_frame_id):
         # estimate total number of frames from spec (num_features, T)

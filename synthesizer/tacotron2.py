@@ -20,7 +20,7 @@ class Tacotron2:
         targets = tf.placeholder(tf.float32, (None, None, hparams.num_mels), name="mel_targets")
         split_infos = tf.placeholder(tf.int32, shape=(hparams.tacotron_num_gpus, None), name="split_infos")
         '''
-        inputs = tf.placeholder(tf.float32, shape=(None, hparams.T, hparams.img_height, hparams.img_width, 3),
+        inputs = tf.placeholder(tf.float32, shape=(None, hparams.T, hparams.img_height, hparams.img_width, hparams.num_channels),
                                 name="inputs"),
         input_lengths = tf.placeholder(tf.int32, shape=(None,), name="input_lengths"),
         targets = tf.placeholder(tf.float32, shape=(None, hparams.mel_step_size, hparams.num_mels), 

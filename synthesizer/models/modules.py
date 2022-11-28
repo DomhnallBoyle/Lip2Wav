@@ -1,6 +1,158 @@
 import tensorflow as tf
 
 
+@tf.custom_gradient
+def grad_reverse(x):
+    y = tf.identity(x)
+
+    def custom_grad(dy):
+        return -dy
+
+    return y, custom_grad
+
+
+class GradientReversal(tf.keras.layers.Layer):
+
+    def __init__(self, _lambda=1):
+        super().__init__()
+        self._lambda = _lambda
+
+    def __call__(self, x):
+        return grad_reverse(x)
+
+
+class SpeakerClassifier:
+    """
+    Speaker Disentanglement classifier w/ reverse gradient
+    """
+
+    def __init__(self, num_speakers):
+        self.scope = 'SpeakerClassifier'
+
+        self.grad_rev = GradientReversal()
+        self.layer_1 = tf.layers.Dense(64, input_shape=(None, 512), activation='relu', name='sdc_layer_1')
+        self.layer_2 = tf.layers.Dense(32, input_shape=(None, 64), activation='relu', name='sdc_layer_2')
+        self.layer_3 = tf.layers.Dense(num_speakers, input_shape=(None, 32), name='sdc_layer_3')
+
+    def __call__(self, inputs):
+        with tf.variable_scope(self.scope):
+            x = inputs
+
+            x = self.grad_rev(x)
+            x = self.layer_1(x)
+            x = self.layer_2(x)
+            x = tf.math.reduce_mean(x, axis=1)  # along frames dimension i.e. (32, 25, x) -> (32, x)
+            x = self.layer_3(x)
+
+            # return tf.nn.log_softmax(x, name='sdc_softmax', axis=-1)
+
+            # return tf.nn.softmax(x, name='sdc_softmax', axis=-1)  # along features dimension i.e. (32, x)
+
+            return x
+
+
+class Deltas:
+    # this has been tested to ensure same output
+    # i.e. np.allclose() == True
+
+    def __init__(self, num_frames, delta_1_num_frames=100, delta_2_num_frames=0):
+        self.num_frames = num_frames
+        self.delta_1_num_frames = delta_1_num_frames
+        self.delta_2_num_frames = delta_2_num_frames
+
+    # def __call__(self, inputs):
+    #     delta_1_matrices = tf.map_fn(lambda x: self.compute_delta_matrix(x, self.delta_1_num_frames), inputs)
+    #
+    #     # this doesn't take long
+    #     return tf.concat([inputs, delta_1_matrices], axis=2)
+
+    # def compute_delta_matrix(self, signal, delta_num_frames):
+    #     # 2 * (sum over i = 1..delwin of i**2) = n(n+1)(2n+1)/3
+    #     sigma_t_squared = (delta_num_frames * (delta_num_frames + 1) * (2 * delta_num_frames + 1)) / 3
+    #     num_features = signal.shape[1]
+    #
+    #     def vector_fn(i):
+    #         vector_delta = tf.zeros(num_features)
+    #         # append to new feature vector the sum of the time difference between
+    #         # a scanning window of feature vectors depending on the size of the
+    #         # frame window
+    #
+    #         for t in range(1, delta_num_frames + 1):
+    #             # indices of feature vectors to use
+    #             # low, high = i - t, i + t
+    #             low, high = tf.subtract(i, t), tf.add(i, t)
+    #
+    #             # feature vectors to use
+    #             vector_low = tf.cond(tf.less(low, 0), lambda: tf.zeros(num_features), lambda: signal[low])
+    #             vector_high = tf.cond(tf.greater_equal(high, self.num_frames), lambda: tf.zeros(num_features),
+    #                                   lambda: signal[high])
+    #
+    #             # append results of difference between
+    #             vector_delta += t * (vector_high - vector_low)
+    #
+    #         # normalise and append vector
+    #         vector_delta /= sigma_t_squared
+    #
+    #         return vector_delta
+    #
+    #     delta_matrix = tf.map_fn(lambda i: vector_fn(i), tf.range(self.num_frames), dtype=tf.float32)
+    #
+    #     return tf.convert_to_tensor(delta_matrix)
+
+    def __call__(self, inputs):
+        # delta_1_matrices = np.asarray([self.compute_delta_matrix(m, self.delta_1_num_frames) for m in inputs])
+        # delta_1_matrices = tf.map_fn(lambda x: self.compute_delta_matrix(x, self.delta_1_num_frames), inputs)
+        delta_1_matrices = tf.convert_to_tensor([self.compute_delta_matrix(inputs[i], self.delta_1_num_frames)
+                                                 for i in range(32)], dtype=tf.float32)
+
+        # delta_1_matrices = np.asarray([self.compute_delta_matrix(inputs[i], self.delta_1_num_frames)
+        #                                for i in range(32)])
+
+        # this doesn't take long
+        return tf.concat([inputs, delta_1_matrices], axis=2)
+
+    def compute_delta_matrix(self, signal, delta_num_frames):
+        import numpy as np
+
+        sigma_t_squared = (delta_num_frames * (delta_num_frames + 1) * (2 * delta_num_frames + 1)) / 3
+        num_frames, num_features = signal.shape
+        delta_matrix = []
+
+        for i in range(self.num_frames):
+            vector_delta = np.zeros(num_features)
+            # append to new feature vector the sum of the time difference between
+            # a scanning window of feature vectors depending on the size of the
+            # frame window
+
+            for t in range(1, delta_num_frames + 1):
+                # indices of feature vectors to use
+                low, high = i - t, i + t
+                # low, high = tf.subtract(i, t), tf.add(i, t)
+
+                # feature vectors to use
+                vector_low = np.zeros(num_features) if low < 0 else signal[low]
+                vector_high = np.zeros(num_features) if high >= self.num_frames else signal[high]
+                # vector_low = tf.cond(tf.less(low, 0), lambda: tf.zeros(num_features), lambda: signal[low])
+                # vector_high = tf.cond(tf.greater_equal(high, self.num_frames), lambda: tf.zeros(num_features),
+                #                       lambda: signal[high])
+
+                # append results of difference between
+                vector_delta += t * (vector_high - vector_low)
+                # vector_delta = tf.add(vector_delta, tf.multiply(tf.cast(t, tf.float32),
+                #                                                 tf.subtract(vector_high, vector_low)))
+
+            # normalise and append vector
+            vector_delta /= sigma_t_squared
+            delta_matrix.append(tf.cast(vector_delta, tf.float32))
+            # delta_matrix.append(tf.cast(tf.divide(vector_delta, sigma_t_squared), tf.float32))
+
+        return tf.convert_to_tensor(delta_matrix, dtype=tf.float32)
+
+        # return np.asarray(delta_matrix).astype(np.float32)
+
+        # return tf.convert_to_tensor(delta_matrix)
+
+
 class HighwayNet:
     def __init__(self, units, name=None):
         self.units = units
@@ -466,6 +618,147 @@ class Postnet:
             x = conv1d(x, self.kernel_size, self.channels, lambda _: _, self.is_training,
                        self.drop_rate,
                        "conv_layer_{}_".format(5) + self.scope)
+        return x
+
+
+class GAN:
+
+    def __init__(self, is_training, scope=None):
+        self.is_training = is_training
+        self.scope = 'gan' if scope is None else scope
+        self.num_layers = 5
+        self.kernel_sizes = [30] + ([24] * 4)
+        self.strides = [5] + ([4] * 4)
+        self.activation_functions = ([tf.nn.relu] * 4) + [tf.nn.tanh]
+        self.channels = [[hparams.postnet_channels] * 4] + [640]
+
+    def __call__(self, x):
+        with tf.variable_scope(self.scope):
+            for i in range(self.num_layers):
+                with tf.variable_scope(f'conv_t_layer_{i+1}_{self.scope}'):
+                    x = tf.layers.conv1d_transpose(
+                        inputs=x,
+                        kernel_size=self.kernel_sizes[i],
+                        filters=self.channels[i],
+                        activation=None,
+                        strides=self.strides[i],
+                        padding='same',
+                    )
+                    x = tf.layers.batch_normalization(x, training=is_training)
+                    x = self.activations[i](x)
+
+        return x
+
+
+class WaveformCritic:
+    """To discriminate the real from the synthesized waveforms"""
+
+    def __init__(self, scope=None):
+        self.scope = 'waveform_critic' if scope is None else scope
+        self.num_layers = 7
+        self.kernel_sizes = [15] + ([41] * 4) + [5, 3]
+        self.strides = [1] + ([4] * 4) + [1, 1]
+        self.activations = [tf.nn.leaky_relu] * 7  # alpha = 0.2 by default
+
+    def __call__(self, x):
+        with tf.variable_scope(self.scope):
+            for i in range(self.num_layers):
+                with tf.variable_scope(f'critic_layer_{i+1}_{self.scope}'):
+                    x = tf.layers.conv2d(
+                        inputs=x,
+                        kernel_size=self.kernel_sizes[i],
+                        filters=None,
+                        activation=self.activations[i],
+                        strides=self.strides[i],
+                        padding='same'
+                    )
+
+        return x
+
+
+def residual_block(x, convs, is_training):
+    skip = x  # skip connection
+
+    for conv in convs:
+        x = conv(x)
+
+    x = tf.layers.batch_normalization(x, training=is_training)
+    x = tf.keras.layers.Add()([x, skip])
+    x = tf.keras.layers.Activation('relu')(x)
+
+    return x
+
+
+class ResNet18:
+
+    def __init__(self, is_training, scope=None):
+        self.scope = 'resnet18' if scope is None else scope
+        self.is_training = is_training
+
+    def __call__(self, x):
+        with tf.variable_scope(self.scope):
+            # 1st residual group
+            for _ in range(2):
+                x = residual_block(
+                    x, convs=[tf.layers.Conv2d(
+                        kernel_size=3,
+                        strides=1,
+                        activation=None
+                    )], is_training=self.is_training
+                )
+
+            # 2nd residual group
+            for _ in range(2):
+                x = residual_block(
+                    x, convs=[tf.layers.Conv2d(
+                        kernel_size=3,
+                        strides=1,
+                        activation=None
+                    )], is_training=self.is_training
+                )
+
+            # 3rd residual group
+            for _ in range(3):
+                x = residual_block(x, convs=[
+                    tf.layers.Conv2d(kernel_size=3, strides=2),
+                    tf.layers.Conv2d(kernel_size=3, strides=2)
+                ], is_training=self.is_training)
+                for j in range(2):
+                    x = residual_block(x, convs=[tf.layers.Conv2d(kernel_size=3, strides=1)],
+                                       is_training=self.is_training)
+
+            # adaptive average pooling
+            x = tf.layers.AdaptiveAveragePooling2D(1)(x)
+
+        return x
+
+
+class PowerCritic:
+    """To discriminate the spectrograms computed from real and generated audio"""
+
+    def __init__(self, scope=None):
+        self.scope = 'power_critic' if scope is None else scope
+        self.reset18_2d = None
+
+    def __call__(self, x):
+        with tf.variable_scope(self.scope):
+            x = tf.layers.conv2d(
+                inputs=x,
+                kernel_size=7,
+                strides=2,
+                activation=tf.nn.relu,
+            )
+            x = tf.layers.max_pooling2d(
+                inputs=x,
+                pool_size=3,
+                strides=2,
+            )
+            x = self.reset18_2d(x)
+            x = tf.layers.dense(
+                inputs=x,
+                units=512,
+            )
+
         return x
 
 

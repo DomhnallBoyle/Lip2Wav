@@ -32,7 +32,7 @@ class Tacotron():
     
     def initialize(self, inputs, input_lengths, embed_targets, mel_targets=None, 
                    stop_token_targets=None, linear_targets=None, targets_lengths=None, gta=False,
-                   global_step=None, is_training=False, is_evaluating=False, split_infos=None):
+                   global_step=None, is_training=False, is_evaluating=False, split_infos=None, speaker_targets=None):
         """
         Initializes the model for inference sets "mel_outputs" and "alignments" fields.
         Args:
@@ -63,7 +63,9 @@ class Tacotron():
         if is_training and is_evaluating:
             raise RuntimeError(
                 "Model can not be in training and evaluation modes at the same time!")
-        
+
+        self.is_training = is_training
+
         split_device = "/cpu:0" if self._hparams.tacotron_num_gpus > 1 or \
 								   self._hparams.split_on_cpu else "/gpu:{}".format(
             self._hparams.tacotron_gpu_start_idx)
@@ -100,7 +102,7 @@ class Tacotron():
             batch_size = tf.shape(inputs)[0]
             mel_channels = hp.num_mels
             for i in range(hp.tacotron_num_gpus):
-                tower_inputs.append(tf.reshape(p_inputs[i], [batch_size, hparams.T, hparams.img_height, hparams.img_width, 3]))
+                tower_inputs.append(tf.reshape(p_inputs[i], [batch_size, hparams.T, hparams.img_height, hparams.img_width, hparams.num_channels]))
                 if p_mel_targets is not None:
                     tower_mel_targets.append(
                         tf.reshape(p_mel_targets[i], [batch_size, -1, mel_channels]))
@@ -115,6 +117,7 @@ class Tacotron():
         self.tower_alignments = []
         #self.tower_stop_token_prediction = []
         self.tower_mel_outputs = []
+        self.sdc_outputs = []  # speaker disentanglement classifier outputs
         
         tower_embedded_inputs = []
         tower_enc_conv_output_shape = []
@@ -153,9 +156,21 @@ class Tacotron():
                                    zoneout=hp.tacotron_zoneout_rate, scope="encoder_LSTM"))
                     
                     encoder_outputs = encoder_cell(embedded_inputs, tower_input_lengths[i])
-                    
+
+                    # deltas and delta-deltas features
+                    if self._hparams.use_deltas_features:
+                        deltas = Deltas(num_frames=self._hparams.T)
+                        encoder_outputs = deltas(encoder_outputs)
+
                     # For shape visualization purpose
                     enc_conv_output_shape = encoder_cell.conv_output_shape
+
+                    # speaker disentanglement from visual features
+                    # reverse gradient
+                    if self._hparams.speaker_disentanglement:
+                        speaker_classifier = SpeakerClassifier(num_speakers=self._hparams.num_speakers)
+                        cls_outputs = speaker_classifier(encoder_outputs)
+                        self.sdc_outputs.append(cls_outputs)
 
                     ### SV2TT2 ###
                     
@@ -165,10 +180,9 @@ class Tacotron():
                     tiled_embed_targets = tf.tile(tileable_embed_targets, 
                                                        [1, tf.shape(encoder_outputs)[1], 1])
                     encoder_cond_outputs = tf.concat((encoder_outputs, tiled_embed_targets), 2)
-                    
+
                     ##############
-                    
-                    
+
                     # Decoder Parts
                     # Attention Decoder Prenet
                     prenet = Prenet(is_training, layers_sizes=hp.prenet_layers,
@@ -304,7 +318,9 @@ class Tacotron():
         # self.tower_linear_targets = tower_linear_targets
         self.tower_targets_lengths = tower_targets_lengths
         #self.tower_stop_token_targets = tower_stop_token_targets
-        
+
+        self.sdc_targets = speaker_targets
+
         self.all_vars = tf.trainable_variables()
         
         log("Initialized Tacotron model. Dimensions (? = dynamic shape): ")
@@ -340,6 +356,7 @@ class Tacotron():
         self.tower_stop_token_loss = []
         self.tower_regularization_loss = []
         self.tower_linear_loss = []
+        self.tower_sdc_loss = []
         self.tower_loss = []
 
         total_before_loss = 0
@@ -347,6 +364,7 @@ class Tacotron():
         total_stop_token_loss = 0
         total_regularization_loss = 0
         total_linear_loss = 0
+        total_sdc_loss = 0
         total_loss = 0
 
         gpus = ["/gpu:{}".format(i) for i in
@@ -430,6 +448,17 @@ class Tacotron():
                     
                     #loss = before + after + stop_token_loss + regularization + linear_loss
                     loss = before + after + regularization + linear_loss
+
+                    if self.is_training and self._hparams.speaker_disentanglement:
+                        # should not run softmax on input to this function
+                        sdc_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.sdc_targets,
+                                                                                  logits=self.sdc_outputs[i])
+                        # outputs loss per batch, mean over the batch
+                        sdc_loss = tf.reduce_mean(sdc_loss)
+
+                        self.tower_sdc_loss.append(sdc_loss)
+                        loss += sdc_loss
+
                     self.tower_loss.append(loss)
 
         for i in range(hp.tacotron_num_gpus):
@@ -438,6 +467,8 @@ class Tacotron():
             #total_stop_token_loss += self.tower_stop_token_loss[i]
             total_regularization_loss += self.tower_regularization_loss[i]
             total_linear_loss += self.tower_linear_loss[i]
+            if self.is_training and self._hparams.speaker_disentanglement:
+                total_sdc_loss += self.tower_sdc_loss[i]
             total_loss += self.tower_loss[i]
         
         self.before_loss = total_before_loss / hp.tacotron_num_gpus
@@ -445,6 +476,8 @@ class Tacotron():
         #self.stop_token_loss = total_stop_token_loss / hp.tacotron_num_gpus
         self.regularization_loss = total_regularization_loss / hp.tacotron_num_gpus
         self.linear_loss = total_linear_loss / hp.tacotron_num_gpus
+        if self.is_training and self._hparams.speaker_disentanglement:
+            self.sdc_loss = total_sdc_loss / hp.tacotron_num_gpus
         self.loss = total_loss / hp.tacotron_num_gpus
 
     def add_optimizer(self, global_step):
@@ -488,7 +521,6 @@ class Tacotron():
         with tf.device(grad_device):
             avg_grads = []
             vars = []
-            #print (tower_gradients)
             for grad_and_vars in zip(*tower_gradients):
                 # grads_vars = [(grad1, var), (grad2, var), ...]
                 grads = []

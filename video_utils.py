@@ -4,6 +4,7 @@ import re
 import subprocess
 import tempfile
 from datetime import timedelta
+from http import HTTPStatus
 
 import cv2
 import numpy as np
@@ -18,12 +19,12 @@ FFMPEG_PATH = '/opt/lip2wav/ffmpeg-4.4.1-i686-static/ffmpeg'
 FFPROBE_PATH = '/opt/lip2wav/ffmpeg-4.4.1-i686-static/ffprobe'
 OLD_FFMPEG_PATH = 'ffmpeg-2.8.15'
 
-FFMPEG_OPTIONS = '-hide_banner -loglevel panic'
+FFMPEG_OPTIONS = '-hide_banner -loglevel error'
 
 VIDEO_CROP_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -ss {{start_time}} -to {{end_time}} -async 1 {{output_video_path}}'
 VIDEO_INFO_COMMAND = f'{FFMPEG_PATH} -i {{input_video_path}}'
 VIDEO_DURATION_COMMAND = f'{FFPROBE_PATH} {FFMPEG_OPTIONS} -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {{video_path}}'
-VIDEO_TO_AUDIO_COMMAND = f'{{ffmpeg_path}} {FFMPEG_OPTIONS} -threads 1 -y -i {{input_video_path}} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {{output_audio_path}}'
+VIDEO_TO_AUDIO_COMMAND = f'{{ffmpeg_path}} {FFMPEG_OPTIONS} -threads 1 -y -i {{input_video_path}} -async 1 -ac 1 -vn -acodec pcm_s16le -ar {{sr}} {{output_audio_path}}'
 VIDEO_CONVERT_FPS_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -strict -2 -filter:v fps=fps={{fps}} {{output_video_path}}'  # copies original codecs and metadata (rotation)
 VIDEO_SPEED_ALTER_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -filter_complex "[0:v]setpts={{video_speed}}*PTS[v];[0:a]atempo={{audio_speed}}[a]" -map "[v]" -map "[a]" {{output_video_path}}'
 VIDEO_REMOVE_AUDIO_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_video_path}} -c copy -an {{output_video_path}}'
@@ -38,7 +39,10 @@ def get_num_frames(video_path):
     return num_frames
 
 
-def get_video_frame(video_path, index):
+def get_video_frame(video_path, index, rotation=None):
+    if rotation is None:
+        rotation = get_video_rotation(video_path)
+
     video_capture = cv2.VideoCapture(video_path)
     i = 0
     selected_frame = None
@@ -47,6 +51,7 @@ def get_video_frame(video_path, index):
         if not success:
             break
         if i == index:
+            frame = fix_frame_rotation(frame, rotation)
             selected_frame = frame
             break
         i += 1
@@ -103,19 +108,34 @@ def get_fps(video_path):
     return fps
 
 
-def get_video_frames(video_path, rotation):
+def get_video_frames(video_path, rotation=None, greyscale=False):
+    if rotation is None:
+        rotation = get_video_rotation(video_path)
+
     video_reader = cv2.VideoCapture(video_path)
     frames = []
     while True:
         success, frame = video_reader.read()
         if not success:
             break
+        if greyscale:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # returns single channel frame
         frame = fix_frame_rotation(frame, rotation)
         frames.append(frame)
 
     video_reader.release()
 
     return frames
+
+
+def save_video_frames(video_frames, video_path, fps, colour): 
+    height, width = video_frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    video_writer = cv2.VideoWriter(video_path, fourcc, fps, (width, height), colour)
+    for frame in video_frames: 
+        video_writer.write(frame.astype(np.uint8))
+    video_writer.release()
 
 
 def show_frames(video_frames, delay, title):
@@ -157,7 +177,7 @@ class RandomRotate:
                 for frame in clip]
 
 
-def run_frame_augmentation(frames, method, random_prob=0.5, rotation_range=10, intensity_range=30):
+def run_frame_augmentation(frames, method, intensity_aug=False, random_prob=0.5, rotation_range=10, intensity_range=30):
     sometimes = lambda aug: va.Sometimes(random_prob, aug)
     random_int = lambda max: np.random.randint(-max, max)  # inclusive
 
@@ -168,20 +188,20 @@ def run_frame_augmentation(frames, method, random_prob=0.5, rotation_range=10, i
             RandomRotate(degrees=random_int(rotation_range)),  # random rotate of angle between (-degrees, degrees)
         ])
     elif method == 'mouth':
-        seq = va.Sequential([
+        augs = [
             sometimes(va.HorizontalFlip()),  # flip video horizontally
-            sometimes(va.Add(random_int(intensity_range))),  # add random value to pixels between (-max, max)
-        ])
+        ]
+        if intensity_aug:
+            augs += [sometimes(va.Add(random_int(intensity_range)))]  # add random value to pixels between (-max, max)
+        seq = va.Sequential(augs)
     else:
         print(f'{method} does not exist')
         return
 
-    # normalize frames to 0-255 uint8 dtype
-    return [cv2.normalize(src=frame, dst=None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-            for frame in seq(frames)]
+    return seq(frames)
 
 
-def extract_audio(video_path, use_old_ffmpeg=False):
+def extract_audio(video_path, sr=16000, use_old_ffmpeg=False):
     audio_file = tempfile.NamedTemporaryFile(suffix='.wav')
 
     if use_old_ffmpeg:
@@ -192,6 +212,7 @@ def extract_audio(video_path, use_old_ffmpeg=False):
     subprocess.call(VIDEO_TO_AUDIO_COMMAND.format(
         ffmpeg_path=ffmpeg_path,
         input_video_path=video_path,
+        sr=sr,
         output_audio_path=audio_file.name
     ), shell=True)
 
@@ -226,7 +247,7 @@ def get_lip_embeddings(video_path):
     with open(video_path, 'rb') as f:
         response = requests.post('http://127.0.0.1:6002/lip_embeddings', files={'video': f.read()})
         if response.status_code != 200:
-            print(response.content)
+            print(video_path, 'failed to extract ARK', response.status_code)
             return
 
         return json.loads(response.content)
@@ -244,3 +265,19 @@ def crop(video_path, start, end):
     ), shell=True)
 
     return output_video_path
+
+
+def run_cfe_cropper(video_path, host):
+    with open(video_path, 'rb') as f:
+        response = requests.post(f'{host}/api/v1/extract/', files={'video': f.read()}, verify=False)
+    if response.status_code != HTTPStatus.OK:
+        print(response.__dict__)
+        return
+
+    # cfe returns video in .avi format
+    with tempfile.NamedTemporaryFile(suffix='.avi') as f:
+        for chunk in response.iter_content(chunk_size=1024):
+            f.write(chunk)
+        f.seek(0)
+
+        return get_video_frames(f.name, greyscale=True)

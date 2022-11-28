@@ -3,11 +3,15 @@ import os
 import shutil
 import subprocess
 import tempfile
+from http import HTTPStatus
 
+import librosa
 import numpy as np
 import requests
+import soundfile as sf
 
 import audio_encoder.audio
+from asr import DeepSpeechASR
 from audio_encoder import inference as eif
 from synthesizer import audio as sa, hparams as hp
 
@@ -19,7 +23,8 @@ FFMPEG_OPTIONS = '-hide_banner -loglevel panic'
 
 # normalise commands
 NORMALISE_AUDIO_COMMAND = f'ffmpeg-normalize -f -q {{input_audio_path}} -o {{output_audio_path}} -ar 16000'
-PAD_AUDIO_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -af "adelay={{delay}}000|{{delay}}000" {{output_audio_path}}'  # pads audio with delay seconds of silence
+PAD_AUDIO_START_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -af "adelay={{delay}}000|{{delay}}000" {{output_audio_path}}'  # pads audio with delay seconds of silence
+PAD_AUDIO_END_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -af "apad=pad_dur={{delay}}" {{output_audio_path}}'
 REMOVE_AUDIO_PAD_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ss 00:00:{{delay}}.000 -acodec pcm_s16le {{output_audio_path}}'  # removes delay seconds of silence
 
 # denoising commands
@@ -44,16 +49,28 @@ eif.load_model(ENCODER_WEIGHTS, device='cpu')
 os.environ['FFMPEG_PATH'] = FFMPEG_PATH  # required for rnnoise
 
 
-def pad_audio(audio_file, delay):
-    padded_audio_file = tempfile.NamedTemporaryFile(suffix='.wav')
+def pad_audio(audio_path, delay, end=False):
+    # pad silence at the start of the audio, end is optional
 
-    subprocess.call(PAD_AUDIO_COMMAND.format(
-        input_audio_path=audio_file.name,
+    pad_start_audio_file = tempfile.NamedTemporaryFile(suffix='.wav')
+    subprocess.call(PAD_AUDIO_START_COMMAND.format(
+        input_audio_path=audio_path,
         delay=delay,
-        output_audio_path=padded_audio_file.name
+        output_audio_path=pad_start_audio_file.name
     ), shell=True)
 
-    return padded_audio_file
+    if end:
+        pad_end_audio_file = tempfile.NamedTemporaryFile(suffix='.wav')
+        subprocess.call(PAD_AUDIO_END_COMMAND.format(
+            input_audio_path=pad_start_audio_file.name,
+            delay=delay,
+            output_audio_path=pad_end_audio_file.name
+        ), shell=True)
+
+        pad_start_audio_file.close()
+        return pad_end_audio_file
+
+    return pad_start_audio_file
 
 
 def remove_audio_pad(audio_file, delay):
@@ -125,7 +142,7 @@ def preprocess_audio(audio_file, delay=3):
     See: https://github.com/slhck/ffmpeg-normalize/issues/87
     """
     # pad, normalise, denoise, normalise and strip
-    padded_audio_file = pad_audio(audio_file, delay=delay)
+    padded_audio_file = pad_audio(audio_file.name, delay=delay)
     normalised_1_audio_file = normalise_audio(padded_audio_file)
     denoised_audio_file = denoise_audio(normalised_1_audio_file)
     normalised_2_audio_file = normalise_audio(denoised_audio_file)
@@ -170,16 +187,68 @@ def get_audio_embeddings(audio_file):
 def extract_audio_embeddings(audio_file, amount=5):
     # get speaker embedding for audio
     wav = audio_encoder.audio.preprocess_wav(audio_file.name)  # resamples the audio if required
-    if len(wav) < SECS * audio_encoder.audio.sampling_rate:
-        return []
 
-    indices = np.random.choice(len(wav) - audio_encoder.audio.sampling_rate * SECS, amount)  # amount random numbers
-    wavs = [wav[idx: idx + audio_encoder.audio.sampling_rate * SECS] for idx in indices]  # amount random sampled wavs
-    embeddings = [eif.embed_utterance(wav).tolist() for wav in wavs]  # amount embeddings
+    # # tries to extract embeddings from 1 second audio first
+    # # if that fails, try 0.5 seconds
+    # for seconds in [SECS, 0.5]:
+    #     if len(wav) < seconds * audio_encoder.audio.sampling_rate:
+    #         continue
+    #
+    #     indices = np.random.choice(len(wav) - int(audio_encoder.audio.sampling_rate * seconds), amount)  # amount random numbers
+    #     wavs = [wav[idx: idx + int(audio_encoder.audio.sampling_rate * seconds)] for idx in indices]  # amount random sampled wavs
+    #
+    #     return [eif.embed_utterance(wav).tolist() for wav in wavs]  # amount embeddings
 
-    return embeddings
+    return [eif.embed_utterance(wav).tolist()]
 
 
-def play_audio(audio_file):
-    subprocess.call(PLAY_SOUND_COMMAND.format(audio_path=audio_file.name),
+def play_audio(audio_path):
+    subprocess.call(PLAY_SOUND_COMMAND.format(audio_path=audio_path),
                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, shell=True)
+
+
+def asr_transcribe(audio_path):
+    deep_speech_asr = DeepSpeechASR()
+
+    return deep_speech_asr.run(audio_path=audio_path)
+
+
+def get_rate_of_speech(audio_path, tmp_audio_path='/tmp/ros_vad.wav'):
+    # ROS in words per second using deepspeech ASR
+
+    # preprocess and VAD to remove silences
+    wav = audio_encoder.audio.preprocess_wav(audio_path)
+    wav_duration_secs = len(wav) / audio_encoder.audio.sampling_rate
+
+    # run STT on the trimmed audio
+    sf.write(tmp_audio_path, wav.astype(np.float32), audio_encoder.audio.sampling_rate)
+
+    deep_speech_asr = DeepSpeechASR()
+    predictions = deep_speech_asr.run(audio_path=tmp_audio_path)
+    num_words = len(predictions[0].split(' '))
+
+    return round(num_words / wav_duration_secs, 2)  # words per second
+
+
+def forced_alignment(audio_path, transcript, host, port=8082):
+    text_file = tempfile.NamedTemporaryFile(suffix='.txt')
+    with open(text_file.name, 'w') as f:
+        f.write(transcript)
+    text_file.seek(0)
+
+    with open(audio_path, 'rb') as f1, open(text_file.name, 'rb') as f2:
+        response = requests.post(f'http://{host}:{port}/align',
+                                 files={'audio': f1.read(), 'transcript': f2.read()})
+
+    text_file.close()
+
+    if response.status_code != HTTPStatus.OK:
+        print(response.__dict__)
+        return
+
+    return response.json()['alignment']
+
+
+def get_audio_duration(audio_path):
+    # duration in seconds
+    return librosa.get_duration(filename=audio_path)

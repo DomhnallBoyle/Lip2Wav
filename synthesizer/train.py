@@ -1,3 +1,15 @@
+from datetime import datetime
+
+import numpy as np
+import os
+import pystoi
+import tensorflow as tf
+import time
+import traceback
+from jiwer import cer as calculate_cer
+from tqdm import tqdm
+
+from audio_utils import asr_transcribe
 from synthesizer.utils.symbols import symbols
 from synthesizer.utils.text import sequence_to_text
 from synthesizer.hparams import hparams_debug_string
@@ -5,14 +17,6 @@ from synthesizer.feeder import Feeder, _batches_per_group
 from synthesizer.models import create_model
 from synthesizer.utils import ValueWindow, plot
 from synthesizer import infolog, audio
-from datetime import datetime
-from tqdm import tqdm
-import tensorflow as tf
-import numpy as np
-import pystoi
-import traceback
-import time
-import os
 
 log = infolog.log
 
@@ -61,24 +65,26 @@ def add_train_stats(model, hparams):
         # tf.summary.scalar('stoi', model.stoi)
         # tf.summary.scalar('estoi', model.estoi)
 
+        if hparams.speaker_disentanglement:
+            tf.summary.scalar('sdc_loss', model.sdc_loss)
+
         return tf.summary.merge_all()
 
 
-def add_eval_stats(summary_writer, step, linear_loss, before_loss, after_loss, loss, stoi, estoi):
+def add_eval_stats(summary_writer, step, linear_loss, before_loss, after_loss, loss, stoi, estoi, cer):
     values = [
-        tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_before_loss",
-                         simple_value=before_loss),
-        tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_after_loss",
-                         simple_value=after_loss),
-        # tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/stop_token_loss",
-        #                  simple_value=stop_token_loss),
+        tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_before_loss", simple_value=before_loss),
+        tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_after_loss", simple_value=after_loss),
+        # tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/stop_token_loss", simple_value=stop_token_loss),
         tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_loss", simple_value=loss),
         tf.Summary.Value(tag='Tacotron_eval_model/eval_stats/eval_stoi', simple_value=stoi),
         tf.Summary.Value(tag='Tacotron_eval_model/eval_stats/eval_estoi', simple_value=estoi)
     ]
     if linear_loss is not None:
-        values.append(tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_linear_loss",
-                                       simple_value=linear_loss))
+        values.append(tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_linear_loss", simple_value=linear_loss))
+    if cer is not None:
+        values.append(tf.Summary.Value(tag="Tacotron_eval_model/eval_stats/eval_cer", simple_value=cer))
+
     test_summary = tf.Summary(value=values)
     summary_writer.add_summary(test_summary, step)
 
@@ -92,13 +98,14 @@ def model_train_mode(args, feeder, hparams, global_step):
         model = create_model("Tacotron", hparams)
         model.initialize(feeder.inputs, feeder.input_lengths, feeder.speaker_embeddings, 
                          feeder.mel_targets, targets_lengths=feeder.targets_lengths, global_step=global_step,
-                         is_training=True, split_infos=feeder.split_infos)
-        print ("Model is initialized....")
+                         is_training=True, split_infos=feeder.split_infos, speaker_targets=feeder.speaker_targets)
+        print("Model is initialized....")
         model.add_loss()
-        print ("Loss is added.....")
+        print("Loss is added.....")
         model.add_optimizer(global_step)
-        print ("Optimizer is added....")
+        print("Optimizer is added....")
         stats = add_train_stats(model, hparams)
+
         return model, stats
 
 
@@ -111,6 +118,7 @@ def model_test_mode(args, feeder, hparams, global_step):
                          global_step=global_step, is_training=False, is_evaluating=True,
                          split_infos=feeder.eval_split_infos)
         model.add_loss()
+
         return model
 
 
@@ -150,7 +158,6 @@ def train(log_dir, args, hparams):
             hparams,
             num_test_batches=args.num_test_batches,
             apply_augmentation=args.apply_augmentation,
-            lrw=args.dataset == 'LRW',
             training_sample_pool_location=args.training_sample_pool_location,
             val_sample_pool_location=args.val_sample_pool_location,
             use_selection_weights=args.use_selection_weights
@@ -247,6 +254,9 @@ def train(log_dir, args, hparams):
                     linear_loss = None
                     eval_stois = []
                     eval_estois = []
+                    eval_cers = []
+
+                    use_cer_metric = args.use_cer_metric and (step == 100 or step % args.cer_interval == 0)
 
                     if hparams.predict_linear:
                         for i in tqdm(range(feeder.test_steps)):
@@ -300,8 +310,9 @@ def train(log_dir, args, hparams):
                             after_losses.append(after_loss)
 
                             # calculate average STOI between groundtruth and generated batch mel-specs
+                            # calculate CER using DeepSpeech ASR
                             # done for a SINGLE batch
-                            stoi, estoi = 0, 0
+                            stoi, estoi, cer = 0, 0, 0
                             for gt_melspec, gen_melspec in tqdm(zip(mel_ts, mel_ps)):
                                 gt = audio.inv_mel_spectrogram(gt_melspec.T, hparams)
                                 gen = audio.inv_mel_spectrogram(gen_melspec.T, hparams)
@@ -313,17 +324,31 @@ def train(log_dir, args, hparams):
 
                                 stoi += pystoi.stoi(gt, gen, hparams.sample_rate, extended=False)
                                 estoi += pystoi.stoi(gt, gen, hparams.sample_rate, extended=True)
+
+                                if use_cer_metric:
+                                    audio.save_wav(gt, '/tmp/gt.wav', hparams.sample_rate)
+                                    audio.save_wav(gen, '/tmp/gen.wav', hparams.sample_rate)
+                                    gt_prediction = asr_transcribe('/tmp/gt.wav')[0]
+                                    gen_prediction = asr_transcribe('/tmp/gen.wav')[0]
+                                    try:
+                                        cer += calculate_cer(gt_prediction, gen_prediction)
+                                    except ValueError:
+                                        log(f'CER failed: {gt_prediction}, {gen_prediction}')
+
                             stoi /= len(mel_ts)
                             estoi /= len(mel_ts)
+                            cer /= len(mel_ts)
 
                             eval_stois.append(stoi)
                             eval_estois.append(estoi)
+                            eval_cers.append(cer)
 
                     eval_loss = sum(eval_losses) / len(eval_losses)
                     before_loss = sum(before_losses) / len(before_losses)
                     after_loss = sum(after_losses) / len(after_losses)
                     eval_stoi = sum(eval_stois) / len(eval_stois)
                     eval_estoi = sum(eval_estois) / len(eval_estois)
+                    eval_cer = sum(eval_cers) / len(eval_cers) if use_cer_metric else None
 
                     # print(mel_ps.shape)  # (32, 80, 80)
 
@@ -368,7 +393,8 @@ def train(log_dir, args, hparams):
 
                     log("Eval loss for global step {}: {:.3f}".format(step, eval_loss))
                     log("Writing eval summary!")
-                    add_eval_stats(summary_writer, step, linear_loss, before_loss, after_loss, eval_loss, eval_stoi, eval_estoi)
+                    add_eval_stats(summary_writer, step, linear_loss, before_loss, after_loss, eval_loss, eval_stoi,
+                                   eval_estoi, eval_cer)
 
                 if step % args.checkpoint_interval == 0 or step == args.tacotron_train_steps or step == 300:
 
