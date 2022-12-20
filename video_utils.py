@@ -220,6 +220,9 @@ def extract_audio(video_path, sr=16000, use_old_ffmpeg=False):
 
 
 def convert_fps(video_path, new_video_path, fps):
+    if get_fps(video_path=video_path) == fps:
+        return video_path
+
     subprocess.call(VIDEO_CONVERT_FPS_COMMAND.format(
         input_video_path=video_path,
         output_video_path=new_video_path,

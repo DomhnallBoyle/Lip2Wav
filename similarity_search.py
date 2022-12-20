@@ -14,7 +14,6 @@ import numpy as np
 import redis
 
 from audio_utils import get_audio_embeddings, get_rate_of_speech, preprocess_audio
-from gender_detection.detection import detect as detect_gender
 from video_utils import get_lip_embeddings, get_video_frame, get_video_rotation, extract_audio
 
 HASH_SIZE = 6

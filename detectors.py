@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 
 import cv2
@@ -65,18 +66,17 @@ def get_face_landmarks(frame, face_coords=None):
     return face_coords, np.array([[p.x, p.y] for p in landmarks.parts()])
 
 
-def get_face_landmarks_fan(frame, device='cpu'): 
+def get_face_landmarks_fan(frame): 
     global fan_face_detector, fan_landmark_predictor
-
-    if fan_face_detector == None and fan_landmark_predictor == None:
+    if fan_face_detector is None or fan_landmark_predictor is None:
         fan_face_detector = RetinaFacePredictor(
-            device=device,
+            device=os.environ.get('CUDA_VISIBLE_DEVICES', 'cuda'),
             threshold=0.8, 
             model=RetinaFacePredictor.get_model('resnet50')
         )
         fan_landmark_predictor = FANPredictor(
-            device=device,
-            model=FANPredictor.get_model('2dfan2_alt')  # default = 2dfan2
+            device=os.environ.get('CUDA_VISIBLE_DEVICES', 'cuda'),
+            model=None  # default = 2dfan2, vsrml uses this
         )  
 
     detected_faces = fan_face_detector(frame, rgb=False)  # i.e. BGR format

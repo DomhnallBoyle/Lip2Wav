@@ -3,16 +3,19 @@ import argparse
 import math
 import multiprocessing
 import os
-import random
 import re
 import sqlite3
+import struct
 import subprocess
-import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import redis
 import requests
+import torch
+import whisper
 from tqdm import tqdm
 
 
@@ -276,6 +279,105 @@ def pose_sqlite_db_create(args):
         p.starmap(pose_sqlite_process, tasks)  
         
 
+def to_redis(arr, video_path):
+    arr_dtype = bytearray(str(arr.dtype), 'utf-8')
+    arr_shape = bytearray(','.join([str(a) for a in arr.shape]), 'utf-8')
+    sep = bytearray('|', 'utf-8')
+    arr_bytes = arr.ravel().tobytes()
+    video_path_bytes = bytearray(str(video_path), 'utf-8')
+
+    to_return = video_path_bytes + sep + arr_dtype + sep + arr_shape + sep + arr_bytes
+
+    return to_return
+
+
+def from_redis(serialized_arr):
+    sep = '|'.encode('utf-8')
+    i_0 = serialized_arr.find(sep)
+    i_1 = serialized_arr.find(sep, i_0 + 1)
+    i_2 = serialized_arr.find(sep, i_1 + 1)
+
+    video_path = serialized_arr[:i_0].decode('utf-8')
+    arr_dtype = serialized_arr[i_0 + 1:i_1].decode('utf-8')
+    arr_shape = tuple([int(a) for a in serialized_arr[i_1 + 1:i_2].decode('utf-8').split(',')])
+    arr_str = serialized_arr[i_2 + 1:]
+    arr = np.frombuffer(arr_str, dtype = arr_dtype).reshape(arr_shape)
+
+    return arr, video_path
+
+
+def language_detection_whisper(args): 
+    r = redis.Redis(host='0.0.0.0')
+    r.delete(args.queue_name)
+
+    model = whisper.load_model('medium')  # ~5GB VRAM
+
+    while True: 
+        print('Queue size:', r.llen(args.queue_name))
+        encoded = r.rpop(args.queue_name)  # removes from tail
+        if encoded is None: 
+            time.sleep(1)
+            continue
+        mel, video_path = from_redis(encoded)
+
+        _, probs = model.detect_language(torch.from_numpy(mel).to(model.device))
+        lang = max(probs, key=probs.get)
+        conf = probs[lang]  # softmax score
+
+        with Path(args.output_path).open('a') as f:
+            f.write(f'{video_path} {lang} {conf}\n')
+
+
+def language_detection_worker(i, args, video_paths):
+    r = redis.Redis(host='0.0.0.0')
+
+    audio_path = f'/tmp/audio_{i}.wav'
+    for video_path in tqdm(video_paths):
+        while r.llen(args.queue_name) > 100:  # don't overload redis
+            time.sleep(1)
+        command = f'ffmpeg -hide_banner -loglevel error -threads 1 -y -i {video_path} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {audio_path}'
+        subprocess.call(command, shell=True)
+
+        audio = whisper.load_audio(audio_path)
+        audio = whisper.pad_or_trim(audio)  # trimmed to 30 seconds
+        mel = whisper.log_mel_spectrogram(audio).numpy()
+        encoded = to_redis(mel, video_path)
+
+        r.lpush(args.queue_name, bytes(encoded))  # push to the head
+        
+
+def language_detection_workers(args):
+    video_paths = [os.path.join(root, f) for root, dirs, files in os.walk(args.voxceleb_directory)
+                   for f in files if f[-4:] == '.mp4']
+    # video_paths = [str(p) for p in list(Path('/media/alex/Storage/Domhnall/datasets/vox_celeb/2/videos/dev/samples').glob('*.mp4'))]
+    print('Total video paths:', len(video_paths))
+
+    # check if video paths already done
+    output_path = Path(args.output_path)
+    if output_path.exists():
+        with output_path.open('r') as f:
+            processed_video_paths = [l.split(' ')[0].strip() for l in f.read().splitlines()]
+        video_paths = list(set(video_paths) - set(processed_video_paths))
+        if not video_paths:
+            print('No videos left to process')
+            exit()
+
+    print('Video paths left to process:', len(video_paths))
+
+    tasks = []
+    num_paths_per_process = len(video_paths) // args.num_workers
+    for i in range(args.num_workers): 
+        start = i * num_paths_per_process
+        if i == args.num_workers - 1:
+            end = len(video_paths)
+        else:
+            end = start + num_paths_per_process
+        tasks.append([i, args, video_paths[start:end]])
+
+    with multiprocessing.Pool(processes=args.num_workers) as p:
+        p.starmap(language_detection_worker, tasks)
+
+
 def main(args):
     {
         'ffprobe': ffprobe,
@@ -283,6 +385,8 @@ def main(args):
         'pose': pose,
         'pose_2': pose_2,
         'pose_sqlite_db_create': pose_sqlite_db_create, 
+        'language_detection_whisper': language_detection_whisper,
+        'language_detection_workers': language_detection_workers
     }[args.run_type](args)
 
 
@@ -319,5 +423,15 @@ if __name__ == '__main__':
     parser_5.add_argument('processed_directory')
     parser_5.add_argument('db_path')
     parser_5.add_argument('--num_processes', type=int, default=5)
+
+    parser_6 = sub_parsers.add_parser('language_detection_whisper')
+    parser_6.add_argument('queue_name')
+    parser_6.add_argument('output_path')
+
+    parser_7 = sub_parsers.add_parser('language_detection_workers')
+    parser_7.add_argument('voxceleb_directory')
+    parser_7.add_argument('queue_name')
+    parser_7.add_argument('output_path')
+    parser_7.add_argument('--num_workers', type=int, default=5)
 
     main(parser.parse_args())

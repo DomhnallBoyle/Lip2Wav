@@ -41,7 +41,10 @@ def main(args):
     redis_server = redis.Redis(host=args.redis_host, port=args.redis_port)
 
     if dataset == 'GENERIC':
-        video_paths = list(videos_root.rglob(args.videos_glob_path))
+        method = 'glob'
+        if args.recursive:
+            method = 'r' + method
+        video_paths = list(getattr(videos_root, method)(args.videos_glob_path))
         if args.seed:
             np.random.seed(args.seed)
         if args.num_samples:
@@ -184,6 +187,7 @@ if __name__ == '__main__':
     parser_1.add_argument('videos_glob_path', help='*/train/*.mp4')
     parser_1.add_argument('--num_samples', type=int)
     parser_1.add_argument('--seed', type=int, default=1234)
+    parser_1.add_argument('--recursive', action='store_true')
 
     parser_2 = sub_parsers.add_parser('SRAVI')
     parser_2.add_argument('--data_captures', type=list_type)

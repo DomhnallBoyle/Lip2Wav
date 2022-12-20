@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 from http import HTTPStatus
@@ -19,10 +18,10 @@ from synthesizer import audio as sa, hparams as hp
 FFMPEG_PATH = '/opt/lip2wav/ffmpeg-4.4.1-i686-static/ffmpeg'
 RNNOISE_PATH = '/opt/rnnoise/examples/rnnoise_demo'
 
-FFMPEG_OPTIONS = '-hide_banner -loglevel panic'
+FFMPEG_OPTIONS = '-hide_banner -loglevel error'
 
 # normalise commands
-NORMALISE_AUDIO_COMMAND = f'ffmpeg-normalize -f -q {{input_audio_path}} -o {{output_audio_path}} -ar 16000'
+NORMALISE_AUDIO_COMMAND = f'ffmpeg-normalize -f -q {{input_audio_path}} -o {{output_audio_path}} -ar {{sr}}'
 PAD_AUDIO_START_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -af "adelay={{delay}}000|{{delay}}000" {{output_audio_path}}'  # pads audio with delay seconds of silence
 PAD_AUDIO_END_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -af "apad=pad_dur={{delay}}" {{output_audio_path}}'
 REMOVE_AUDIO_PAD_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ss 00:00:{{delay}}.000 -acodec pcm_s16le {{output_audio_path}}'  # removes delay seconds of silence
@@ -34,7 +33,7 @@ REMOVE_AUDIO_PAD_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_
 WAV_TO_PCM_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ac 1 -ar 48000 -f s16le -acodec pcm_s16le {{output_audio_path}}'  # 16-bit pcm w/ 48khz
 DENOISE_COMMAND = f'{RNNOISE_PATH} {{input_audio_path}} {{output_audio_path}}'
 PCM_TO_WAV_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -f s16le -ar 48000 -ac 1 -i {{input_audio_path}} {{output_audio_path}}'
-WAV_TO_16KHZ_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ac 1 -vn -acodec pcm_s16le -ar 16000 {{output_audio_path}}'
+WAV_CONVERT_HZ_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ac 1 -vn -acodec pcm_s16le -ar {{sr}} {{output_audio_path}}'
 
 # lrw cropping commands
 CROP_AUDIO_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}} -ss 00:00:00.{{start_millis}} -t 00:00:00.{{duration_millis}} {{output_audio_path}}'
@@ -85,41 +84,47 @@ def remove_audio_pad(audio_file, delay):
     return stripped_audio_file
 
 
-def normalise_audio(audio_file):
+def normalise_audio(audio_file, sr=16000):
     normalised_audio_file = tempfile.NamedTemporaryFile(suffix='.wav')
 
     subprocess.call(NORMALISE_AUDIO_COMMAND.format(
         input_audio_path=audio_file.name,
-        output_audio_path=normalised_audio_file.name
+        output_audio_path=normalised_audio_file.name,
+        sr=sr
     ), shell=True)
 
     return normalised_audio_file
 
 
-def denoise_audio(audio_file):
+def denoise_audio(audio_file, sr=16000):
     noisy_pcm_file = tempfile.NamedTemporaryFile(suffix='.pcm')
     denoised_pcm_file = tempfile.NamedTemporaryFile(suffix='.pcm')
     denoised_wav_file = tempfile.NamedTemporaryFile(suffix='.wav')
     denoised_wav_file_final = tempfile.NamedTemporaryFile(suffix='.wav')
 
+    # convert to PCM 48kHz (required by rnnoise)
     subprocess.call(WAV_TO_PCM_COMMAND.format(
         input_audio_path=audio_file.name,
         output_audio_path=noisy_pcm_file.name
     ), shell=True)
 
+    # denoise
     subprocess.call(DENOISE_COMMAND.format(
         input_audio_path=noisy_pcm_file.name,
         output_audio_path=denoised_pcm_file.name
     ), shell=True)
 
+    # convert back to WAV 48kHz
     subprocess.call(PCM_TO_WAV_COMMAND.format(
         input_audio_path=denoised_pcm_file.name,
         output_audio_path=denoised_wav_file.name
     ), shell=True)
 
-    subprocess.call(WAV_TO_16KHZ_COMMAND.format(
+    # convert to original sr
+    subprocess.call(WAV_CONVERT_HZ_COMMAND.format(
         input_audio_path=denoised_wav_file.name,
-        output_audio_path=denoised_wav_file_final.name
+        output_audio_path=denoised_wav_file_final.name, 
+        sr=sr
     ), shell=True)
 
     for f in [noisy_pcm_file, denoised_pcm_file, denoised_wav_file]:
@@ -128,7 +133,7 @@ def denoise_audio(audio_file):
     return denoised_wav_file_final
 
 
-def preprocess_audio(audio_file, delay=3):
+def preprocess_audio(audio_file, delay=3, sr=16000):
     """
     It was found that denoising and then normalising the audio produced louder/more background noise
         - the denoising doesn't work as well on softer audio
@@ -143,14 +148,16 @@ def preprocess_audio(audio_file, delay=3):
     """
     # pad, normalise, denoise, normalise and strip
     padded_audio_file = pad_audio(audio_file.name, delay=delay)
-    normalised_1_audio_file = normalise_audio(padded_audio_file)
+    normalised_1_audio_file = normalise_audio(padded_audio_file, sr=sr)
     denoised_audio_file = denoise_audio(normalised_1_audio_file)
-    normalised_2_audio_file = normalise_audio(denoised_audio_file)
+    normalised_2_audio_file = normalise_audio(denoised_audio_file, sr=sr)
     stripped_audio_file = remove_audio_pad(normalised_2_audio_file, delay=delay)
 
     for f in [padded_audio_file, normalised_1_audio_file,
               denoised_audio_file, normalised_2_audio_file]:
         f.close()
+
+    assert get_audio_sample_rate(audio_path=stripped_audio_file.name) == sr
 
     return stripped_audio_file
 
@@ -252,3 +259,7 @@ def forced_alignment(audio_path, transcript, host, port=8082):
 def get_audio_duration(audio_path):
     # duration in seconds
     return librosa.get_duration(filename=audio_path)
+
+
+def get_audio_sample_rate(audio_path): 
+    return librosa.get_samplerate(path=audio_path)
