@@ -1,3 +1,4 @@
+import argparse
 import json
 import tempfile
 
@@ -21,9 +22,13 @@ def get_audio_embeddings():
     return json.dumps(speaker_embeddings)
 
 
-def main():
-    app.run(host='0.0.0.0', port=6001)
+def main(args):
+    app.run(host='0.0.0.0', port=args.port)
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, default=6001)
+
+    main(parser.parse_args())
+

@@ -4,7 +4,7 @@ import multiprocessing
 import pickle
 import random
 import shutil
-import tempfile
+import sys
 import traceback
 import uuid
 from pathlib import Path
@@ -13,7 +13,7 @@ import numpy as np
 import redis
 from tqdm import tqdm
 
-from audio_utils import extract_mel_spectrogram, get_audio_embeddings, get_audio_sample_rate, play_audio, preprocess_audio
+from audio_utils import extract_mel_spectrogram, get_audio_embeddings, play_audio, preprocess_audio as denoise_audio
 from detectors import get_face_landmarks, get_face_landmarks_fan, get_mouth_frames_perspective_warp_2, \
     get_mouth_frames_wrapper, smooth_landmarks
 from preprocessor import generate_speaker_video_mapping, get_speaker_and_content
@@ -37,16 +37,18 @@ def interpolate_2d(m, s):
     return f(y2, x2)
 
 
-def process_video_2(process_index, video_path, speaker_embedding_audio_file, landmarks_directory, debug=False):
+def process_video_2(process_index, video_path, speaker_embedding_audio_file, landmarks_directory, denoise=False, skip_mel_spec=False, debug=False):
     video_fps_conversion_path = f'/tmp/video_fps_conversion_output_{process_index}.mp4'
 
     # get audio from video (convert fps if required)
-    audio_file = extract_audio(video_path=convert_fps(video_path=video_path, new_video_path=video_fps_conversion_path, fps=hparams.fps), sr=hparams.sample_rate)
-    preprocessed_audio_file = preprocess_audio(audio_file=audio_file, sr=hparams.sample_rate)
-    audio_file.close()
-    audio_file = preprocessed_audio_file
-    if debug:
-        play_audio(audio_file.name)
+    if not skip_mel_spec:
+        audio_file = extract_audio(video_path=convert_fps(video_path=video_path, new_video_path=video_fps_conversion_path, fps=hparams.fps), sr=hparams.sample_rate)
+        if denoise:
+            denoised_audio_file = denoise_audio(audio_file=audio_file, sr=hparams.sample_rate)
+            audio_file.close()
+            audio_file = denoised_audio_file
+        if debug:
+            play_audio(audio_file.name)
 
     # get video landmarks
     # NOTE: landmarks from method and landmarks from file produce same landmarks
@@ -88,9 +90,10 @@ def process_video_2(process_index, video_path, speaker_embedding_audio_file, lan
 
     # extract speaker embedding - was trained on 16kHz audios (Librispeech + Vox 1 & 2)
     # NOTE: this has a memory leak somewhere - on-going issue on github
-    preprocessed_speaker_embedding_audio_file = preprocess_audio(audio_file=speaker_embedding_audio_file, sr=SPEAKER_EMBEDDING_SAMPLE_RATE)
-    speaker_embedding_audio_file.close()
-    speaker_embedding_audio_file = preprocessed_speaker_embedding_audio_file
+    if denoise:
+        denoised_speaker_embedding_audio_file = denoise_audio(audio_file=speaker_embedding_audio_file, sr=SPEAKER_EMBEDDING_SAMPLE_RATE)
+        speaker_embedding_audio_file.close()
+        speaker_embedding_audio_file = denoised_speaker_embedding_audio_file
     if debug:
         play_audio(speaker_embedding_audio_file.name)
     speaker_embeddings = get_audio_embeddings(audio_file=speaker_embedding_audio_file)
@@ -99,16 +102,21 @@ def process_video_2(process_index, video_path, speaker_embedding_audio_file, lan
     speaker_embedding = np.asarray(speaker_embeddings[0]).astype(np.float32)
     speaker_embedding_audio_file.close()
 
-    # extract mel-spec (interpolate if required)
-    mel_spec = extract_mel_spectrogram(audio_file=audio_file).T
-    duration = len(mouth_frames) / hparams.fps
-    if mel_spec.shape[0] != int(duration * 80): 
-        mel_spec = interpolate_2d(mel_spec, (int(duration * 80), mel_spec.shape[1]))
-    assert mel_spec.shape[0] == int(duration * 80) == mouth_frames.shape[0] * 4, f'{mel_spec.shape[0]}, {int(duration * 80)}, {mouth_frames.shape[0] * 4}'
-    mel_spec = mel_spec.astype(np.float32)
-    audio_file.close()
+    sample = [mouth_frames, speaker_embedding]
 
-    return [mouth_frames, speaker_embedding, mel_spec]
+    # extract mel-spec (interpolate if required)
+    # NOTE: there is some slight difference between mel-spec and video frame length - use interpolation to fix
+    if not skip_mel_spec:
+        mel_spec = extract_mel_spectrogram(audio_file=audio_file).T
+        duration = len(mouth_frames) / hparams.fps
+        if mel_spec.shape[0] != int(duration * 80):
+            mel_spec = interpolate_2d(mel_spec, (int(duration * 80), mel_spec.shape[1]))
+        assert mel_spec.shape[0] == int(duration * 80) == mouth_frames.shape[0] * 4, f'{mel_spec.shape[0]}, {int(duration * 80)}, {mouth_frames.shape[0] * 4}'
+        mel_spec = mel_spec.astype(np.float32)
+        audio_file.close()
+        sample += [mel_spec]
+
+    return sample
 
 
 def process_video(process_index, video_path, save_video_path, output_directory, speaker_embedding_audio_file, fps, greyscale, 
@@ -277,6 +285,11 @@ def get_speaker_embedding_audio_file(args, video_path, debug):
 
             # use speaker embedding from same video
             speaker_embedding_audio_file = extract_audio(video_path=video_path, sr=SPEAKER_EMBEDDING_SAMPLE_RATE)
+    elif args.use_extracted_audio_path:
+        audio_path = Path(video_path).with_suffix('.wav')
+        speaker_embedding_audio_file = audio_path.open('r')
+    elif args.default_audio_path: 
+        speaker_embedding_audio_file = Path(args.default_audio_path).open('r')
     else:
         speaker_embedding_audio_file = extract_audio(video_path=video_path, sr=SPEAKER_EMBEDDING_SAMPLE_RATE)
 
@@ -327,18 +340,22 @@ def process_wrapper(process_index, args, indexes):
                     video_path=video_path,
                     speaker_embedding_audio_file=speaker_embedding_audio_file,
                     landmarks_directory=args.landmarks_directory,
+                    denoise=args.denoise,
+                    skip_mel_spec=args.skip_mel_spec,
                     debug=debug
                 )
                 if sample is None:
                     continue
             except Exception:
-                print(traceback.format_exc())
-                exit()
+                print(video_path, traceback.format_exc())
+                break
 
             np.savez_compressed(str(args.output_directory.joinpath(f'{str(uuid.uuid4())}.npz')), sample=[save_video_path, *sample])
 
+        # clean-up to save space
+        for video_path in video_paths:
             if '/tmp/' in video_path:
-                os.remove(video_path)  # to save space
+                os.remove(video_path)
 
         # record video as processed, whether it was successful or not
         with processed_videos_path.open('a') as f:
@@ -356,6 +373,11 @@ def process(args):
         shutil.rmtree(str(output_directory))
     output_directory.mkdir(exist_ok=True)
     args.output_directory = output_directory
+
+    # save CLI args for reference later
+    with output_directory.joinpath('log.txt').open('w') as f:
+        for arg in sys.argv:
+            f.write(f'{arg} \\\n')
 
     args.speaker_content_mapping = None
     if args.same_speaker_different_content:
@@ -400,6 +422,8 @@ def process(args):
 def server(args): 
     from flask import Flask, request, send_file
 
+    assert Path(args.default_speaker_embedding_video_path).exists()
+
     app = Flask(__name__)
 
     output_directory = Path(args.output_directory)
@@ -415,17 +439,23 @@ def server(args):
         video_file = request.files['video']
         video_file.save(video_path)
 
+        if bool(int(request.args.get('use_audio_from_video', 0))):
+            speaker_embedding_video_path = video_path
+        else:
+            speaker_embedding_video_path = args.default_speaker_embedding_video_path
+    
         sample = process_video_2(
             process_index=0, 
             video_path=video_path, 
-            speaker_embedding_audio_file=extract_audio(video_path=video_path, sr=SPEAKER_EMBEDDING_SAMPLE_RATE), 
-            landmarks_directory=None, 
+            speaker_embedding_audio_file=extract_audio(video_path=speaker_embedding_video_path, sr=SPEAKER_EMBEDDING_SAMPLE_RATE),
+            landmarks_directory=None,
+            denoise=args.denoise,
+            skip_mel_spec=True
         )
         if sample is None:
             raise Exception('Failed to preprocess video')
-        mouth_frames, speaker_embedding, _ = sample 
 
-        np.savez_compressed(output_path, sample=[mouth_frames, speaker_embedding])
+        np.savez_compressed(output_path, sample=sample)
 
         return send_file(output_path, attachment_filename='processed.npz')
 
@@ -435,10 +465,11 @@ def server(args):
 def main(args):
     # set params from the paper
     hparams.set_hparam('fps', 20)
-    # hparams.set_hparam('sample_rate', 24000)
-    # hparams.set_hparam('n_fft', 2048)
-    # hparams.set_hparam('win_size', 1200)
-    # hparams.set_hparam('hop_size', 300)
+    if args.sv2s_params:
+        hparams.set_hparam('sample_rate', 24000)
+        hparams.set_hparam('n_fft', 2048)
+        hparams.set_hparam('win_size', 1200)
+        hparams.set_hparam('hop_size', 300)
 
     f = {
         'process': process,
@@ -448,6 +479,8 @@ def main(args):
 
 if __name__ == '__main__': 
     parser = argparse.ArgumentParser()
+    parser.add_argument('--sv2s_params', action='store_true')
+    parser.add_argument('--denoise', action='store_true')
     sub_parsers = parser.add_subparsers(dest='run_type')
 
     parser_1 = sub_parsers.add_parser('process')
@@ -455,14 +488,18 @@ if __name__ == '__main__':
     parser_1.add_argument('output_directory')
     parser_1.add_argument('--redis_host', default='redis')
     parser_1.add_argument('--num_processes', type=int, default=5)
+    parser_1.add_argument('--default_audio_path')
     parser_1.add_argument('--same_speaker_different_content', action='store_true')
+    parser_1.add_argument('--use_extracted_audio_path', action='store_true')
     parser_1.add_argument('--speaker_id_index', type=int, default=-2)
     parser_1.add_argument('--speed_augmentation', action='store_true')
     parser_1.add_argument('--landmarks_directory')
+    parser_1.add_argument('--skip_mel_spec', action='store_true')
     parser_1.add_argument('--redo', action='store_true')
     parser_1.add_argument('--debug', action='store_true')
 
     parser_2 = sub_parsers.add_parser('server')
     parser_2.add_argument('output_directory')
+    parser_2.add_argument('default_speaker_embedding_video_path')
 
     main(parser.parse_args())

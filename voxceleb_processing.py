@@ -1,11 +1,13 @@
-"""Process VoxCeleb to filter out poor quality, non-english videos"""
+"""
+Process VoxCeleb to filter out poor quality, non-english videos
+Also filter by pose
+"""
 import argparse
 import math
 import multiprocessing
 import os
 import re
 import sqlite3
-import struct
 import subprocess
 import time
 from datetime import datetime
@@ -328,6 +330,11 @@ def language_detection_whisper(args):
             f.write(f'{video_path} {lang} {conf}\n')
 
 
+def extract_audio(video_path, audio_path):
+    command = f'ffmpeg -hide_banner -loglevel error -threads 1 -y -i {video_path} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {audio_path}'
+    subprocess.call(command, shell=True)
+
+
 def language_detection_worker(i, args, video_paths):
     r = redis.Redis(host='0.0.0.0')
 
@@ -335,9 +342,8 @@ def language_detection_worker(i, args, video_paths):
     for video_path in tqdm(video_paths):
         while r.llen(args.queue_name) > 100:  # don't overload redis
             time.sleep(1)
-        command = f'ffmpeg -hide_banner -loglevel error -threads 1 -y -i {video_path} -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 {audio_path}'
-        subprocess.call(command, shell=True)
-
+        extract_audio(video_path, audio_path)
+        
         audio = whisper.load_audio(audio_path)
         audio = whisper.pad_or_trim(audio)  # trimmed to 30 seconds
         mel = whisper.log_mel_spectrogram(audio).numpy()
@@ -378,6 +384,91 @@ def language_detection_workers(args):
         p.starmap(language_detection_worker, tasks)
 
 
+def language_csv_create(args):
+    results_path = Path(args.results_path)
+    assert results_path.exists() and '.txt' in results_path.name
+    with results_path.open('r') as f:
+        results = f.read().splitlines()
+
+    csv_path = Path(args.csv_path)
+    assert str(results_path) != str(csv_path)
+    if csv_path.exists():
+        os.remove(csv_path)
+    with csv_path.open('w') as f:
+        f.write(f'ID,Language,Confidence\n')
+        for line in results:
+            video_path, lang, conf = line.split(' ')
+            video_id = '/'.join(Path(video_path).parts[-3:])
+            f.write(f'{video_id},{lang},{conf}\n')
+
+
+def language_filtering_deepspeech(args):
+    from nltk.corpus import words
+
+    word_pool = set(words.words())
+
+    us_2_gb_d = requests.get('https://raw.githubusercontent.com/hyperreality/American-British-English-Translator/master/data/american_spellings.json').json()
+    gb_2_us_d = {v: k for k, v in us_2_gb_d.items()}
+
+    # deepspeech trained on librispeech - mix of US and GB english
+    test_transcripts = ['my name is domhnall']
+    num_transcripts = len(test_transcripts)
+    valid_transcripts = []
+    for transcript in test_transcripts: 
+        transcript = transcript.strip().lower()
+        words = transcript.split(' ')
+        num_valid_words = sum([word in word_pool for word in words]) 
+        score = num_valid_words / len(words)
+        if score >= args.valid_utt_threshold:
+            valid_transcripts.append(transcript)
+        print(f'~ no. English transcripts: {len(valid_transcripts)} / {len(test_transcripts)}')
+
+    # TODO: 
+    #  include running approx filtered dataset size - should be 1326 hours
+    #  create csv with video id, transcript and score
+
+
+def asr_whisper(args):
+    voxceleb_directory = Path(args.voxceleb_directory)
+
+    with open(args.video_paths_text_file, 'r') as f:
+        video_paths = f.read().splitlines()
+
+    model = whisper.load_model(args.whisper_model)
+    decode_options = whisper.DecodingOptions(fp16=False, language='en')  # no need for language detection
+
+    output_csv_path = Path(args.output_csv_path)
+    audio_path = '/tmp/audio.wav'
+
+    processed_video_ids = []
+    if output_csv_path.exists():
+        with output_csv_path.open('r') as f:
+            processed_video_ids = [l.split(',')[0] for l in f.read().splitlines()]
+    else:
+        with output_csv_path.open('w') as f:
+            f.write('ID,Transcript\n')
+
+    print(f'Already processed {len(processed_video_ids)} videos...')
+    processed_video_ids = set(processed_video_ids)
+
+    for video_path in tqdm(video_paths):
+        video_path = voxceleb_directory.joinpath(video_path)
+        assert video_path.exists()
+        video_id = '/'.join(video_path.parts[-3:])
+        if video_id in processed_video_ids: 
+            continue
+
+        extract_audio(str(video_path), audio_path)
+        audio = whisper.load_audio(audio_path)
+        audio = whisper.pad_or_trim(audio)
+        mel = whisper.log_mel_spectrogram(audio).to(model.device)
+        transcript = whisper.decode(model, mel, decode_options).text
+        transcript = re.sub(r"[^\w\d'\s-]+", '', transcript.lower())  # remove punctuation except apostrophes
+    
+        with output_csv_path.open('a') as f:
+            f.write(f'{video_id},{transcript}\n')
+ 
+
 def main(args):
     {
         'ffprobe': ffprobe,
@@ -386,7 +477,10 @@ def main(args):
         'pose_2': pose_2,
         'pose_sqlite_db_create': pose_sqlite_db_create, 
         'language_detection_whisper': language_detection_whisper,
-        'language_detection_workers': language_detection_workers
+        'language_detection_workers': language_detection_workers,
+        'language_csv_create': language_csv_create,
+        'language_filtering_deepspeech': language_filtering_deepspeech,
+        'asr_whisper': asr_whisper
     }[args.run_type](args)
 
 
@@ -433,5 +527,18 @@ if __name__ == '__main__':
     parser_7.add_argument('queue_name')
     parser_7.add_argument('output_path')
     parser_7.add_argument('--num_workers', type=int, default=5)
+
+    parser_8 = sub_parsers.add_parser('language_csv_create')
+    parser_8.add_argument('results_path')
+    parser_8.add_argument('csv_path')
+
+    parser_9 = sub_parsers.add_parser('language_filtering_deepspeech')
+    parser_9.add_argument('--valid_utt_threshold', type=float, default=0.6)
+
+    parser_10 = sub_parsers.add_parser('asr_whisper')
+    parser_10.add_argument('voxceleb_directory')
+    parser_10.add_argument('video_paths_text_file')
+    parser_10.add_argument('output_csv_path')
+    parser_10.add_argument('--whisper_model', default='medium')
 
     main(parser.parse_args())

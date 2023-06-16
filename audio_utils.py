@@ -42,6 +42,7 @@ CROP_AUDIO_COMMAND = f'{FFMPEG_PATH} {FFMPEG_OPTIONS} -y -i {{input_audio_path}}
 PLAY_SOUND_COMMAND = 'play {audio_path}'
 
 SECS = 1
+# NOTE: this has been checked to make sure it's correct model used in sv2s too
 ENCODER_WEIGHTS = 'audio_encoder/saved_models/pretrained.pt'
 
 eif.load_model(ENCODER_WEIGHTS, device='cpu')
@@ -253,7 +254,7 @@ def forced_alignment(audio_path, transcript, host, port=8082):
         print(response.__dict__)
         return
 
-    return response.json()['alignment']
+    return response.json()['word_alignments']
 
 
 def get_audio_duration(audio_path):

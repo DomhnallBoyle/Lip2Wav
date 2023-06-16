@@ -76,7 +76,7 @@ def get_face_landmarks_fan(frame):
         )
         fan_landmark_predictor = FANPredictor(
             device=os.environ.get('CUDA_VISIBLE_DEVICES', 'cuda'),
-            model=None  # default = 2dfan2, vsrml uses this
+            model=FANPredictor.get_model(os.environ.get('FAN_LANDMARKS_MODEL', '2dfan2'))  # default = 2dfan2, vsrml uses this
         )  
 
     detected_faces = fan_face_detector(frame, rgb=False)  # i.e. BGR format

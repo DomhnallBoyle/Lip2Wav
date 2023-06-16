@@ -256,14 +256,21 @@ def get_lip_embeddings(video_path):
         return json.loads(response.content)
 
 
-def crop(video_path, start, end):
-    suffix = video_path.split('/')[-1].split('.')[1]
-    output_video_path = f'/tmp/cropped_video.{suffix}'
+def crop(video_path, start, end, output_video_path=None):
+    if not output_video_path:
+        suffix = video_path.split('/')[-1].split('.')[1]
+        output_video_path = f'/tmp/cropped_video.{suffix}'
+
+    def ffmpeg_time(t):
+        t = str(timedelta(seconds=t))
+        t = t + '.000' if '.' not in t else t[:-3]
+
+        return '0' + t
 
     subprocess.call(VIDEO_CROP_COMMAND.format(
         input_video_path=video_path,
-        start_time='0' + str(timedelta(seconds=start))[:-3],
-        end_time='0' + str(timedelta(seconds=end))[:-3],
+        start_time=ffmpeg_time(start),
+        end_time=ffmpeg_time(end),
         output_video_path=output_video_path
     ), shell=True)
 
